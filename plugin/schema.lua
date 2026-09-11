@@ -1,0 +1,194 @@
+-- kong/plugins/reva-ai-runtime-authorization/schema.lua
+--
+-- Configuration surface for the Reva Trust Guardian authorization plugin.
+--
+-- NOTE: this file deliberately contains no `require()` calls. Konnect
+-- Dedicated Cloud Gateways reject a schema.lua that requires anything
+-- (including kong.db.schema.typedefs), so every field is spelled out by
+-- hand. Custom validation lives in handler.lua, not here.
+
+local PLUGIN_NAME = "reva-ai-runtime-authorization"
+
+return {
+  name = PLUGIN_NAME,
+  fields = {
+    { config = {
+        type = "record",
+        fields = {
+
+          -- Connecting to Reva Trust Guardian ─────────────────────────────
+          { reva_host_url = {
+              description = "Base URL of your Reva tenant, for example `https://api.example.reva.ai`. The plugin appends `/pdp/v2/ai/evaluation` and evaluates every matching call there.",
+              type = "string",
+              required = true,
+              match = "^https?://",
+          } },
+          { auth_token = {
+              description = "Bearer token Kong presents to Reva Trust Guardian on every evaluation. Find it in the Reva console under Settings. This field is referenceable — store it in a vault rather than inline.",
+              type = "string",
+              required = true,
+              referenceable = true,
+          } },
+          { ssl_verify = {
+              description = "Verify the TLS certificate presented by Reva Trust Guardian. Turn this off only against a test instance with a self-signed certificate.",
+              type = "boolean",
+              default = true,
+          } },
+
+          -- Enforcement: what happens to a denied call ────────────────────
+          { monitor_mode = {
+              description = "Evaluate every call and log the verdict, but never block. Use it to see what policy would refuse before you enforce it.",
+              type = "boolean",
+              default = false,
+          } },
+          { fail_open = {
+              description = "Proxy the request when Reva Trust Guardian cannot be reached or returns no decision. Off by default, so an outage refuses calls rather than passing them unevaluated.",
+              type = "boolean",
+              default = false,
+          } },
+          { deny_status = {
+              description = "HTTP status returned when a call is refused, either by policy or because no decision could be obtained.",
+              type = "integer",
+              default = 403,
+              between = { 100, 599 },
+          } },
+          { deny_message = {
+              description = "Message returned to the caller in the response body when a call is refused. The specific reason is returned alongside it.",
+              type = "string",
+              default = "Blocked by Reva",
+          } },
+
+          -- Identity: who the call is attributed to ───────────────────────
+          { authorize_agent = {
+              description = "Make the calling agent the subject of each evaluation, which requires an agent id on the request. Leave it off to attribute every call to the user from the JWT instead.",
+              type = "boolean",
+              default = false,
+          } },
+          { jwt_user_claim = {
+              description = "JWT claim read from the bearer token to identify the user. Common values are `sub`, `preferred_username` and `cognito:username`.",
+              type = "string",
+              default = "sub",
+          } },
+          { jwt_groups_claim = {
+              description = "JWT claim holding the user's group memberships, sent to Reva Trust Guardian as groups a policy can match. Use `roles` for RBAC tokens, `realm_access.roles` for Keycloak, or `cognito:groups` for Cognito.",
+              type = "string",
+              default = "groups",
+          } },
+          { agent_header = {
+              description = "Request header carrying the calling agent's id. Read only when `authorize_agent` is on, and only when `identity_source` permits the header.",
+              type = "string",
+              default = "X-Reva-Agent-Id",
+          } },
+          { require_identity_headers = {
+              description = "Reject a request that is missing the agent id rather than proxying it unevaluated. Applies only when `authorize_agent` is on; the user is always required.",
+              type = "boolean",
+              default = true,
+          } },
+          { identity_source = {
+              description = "Where the calling agent's identity comes from. `consumer` reads it from an authenticated Kong Consumer and cannot be forged; `header` trusts the agent header as sent; `consumer_then_header` prefers the Consumer and falls back.",
+              type = "string",
+              default = "header",
+              one_of = { "consumer", "header", "consumer_then_header" },
+          } },
+          { consumer_id_field = {
+              description = "Which property of the authenticated Kong Consumer names the agent: `username`, `custom_id` or `id`.",
+              type = "string",
+              default = "username",
+              one_of = { "username", "custom_id", "id" },
+          } },
+
+          -- Call classification ───────────────────────────────────────────
+          { path_identification = {
+              description = "How the plugin decides whether a call is an LLM, MCP or A2A request.",
+              type = "record",
+              fields = {
+                  { enabled = {
+                      description = "Classify calls by their request path prefix. Turn this off when your LLM, MCP and A2A services share arbitrary URLs; the plugin then inspects the request body instead.",
+                      type = "boolean",
+                      default = true,
+                  } },
+                  { llm_path_prefix = {
+                      description = "Requests under this path prefix are treated as OpenAI-style model invocations, such as chat completions.",
+                      type = "string",
+                      default = "/llm",
+                  } },
+                  { mcp_path_prefix = {
+                      description = "MCP tool calls are identified by this path prefix. The next path segment names the MCP server, for example `/mcp/github/`. Only `tools/call` is evaluated.",
+                      type = "string",
+                      default = "/mcp/",
+                  } },
+                  { a2a_path_prefix = {
+                      description = "A2A agent invocations are identified by this path prefix. The target agent is identified by the Kong Service host, not by the path. Only `message/send` is evaluated.",
+                      type = "string",
+                      default = "/a2a/",
+                  } },
+              },
+          } },
+
+          -- Reading the payload, and grouping turns into a chat ───────────
+          { prompt_key = {
+              description = "Names the field carrying the prompt text in the evaluation request. Must match what your policy expects to read.",
+              type = "string",
+              default = "content",
+          } },
+          { a2a_content_path = {
+              description = "Path within the JSON-RPC body to the current A2A message. Each part's text is joined into one prompt. Change it only if your callers place the message elsewhere.",
+              type = "string",
+              default = "params.message.parts",
+          } },
+          { a2a_history_path = {
+              description = "Path within the JSON-RPC body to prior conversation turns. Not part of the A2A specification — point this wherever your callers store history.",
+              type = "string",
+              default = "params.history",
+          } },
+          { a2a_routing_path = {
+              description = "Path within the JSON-RPC body to the declared hop chain. Not part of the A2A specification — point this wherever your callers declare routing.",
+              type = "string",
+              default = "params.routing",
+          } },
+          { session_header = {
+              description = "Request header carrying the chat session id, which groups separate requests into one conversation. Without it every request looks like a fresh chat and no history is sent.",
+              type = "string",
+              default = "X-Reva-Session-Id",
+          } },
+          { max_session_messages = {
+              description = "How many completed turns to send as chat history, newest kept. Reva Trust Guardian rejects a request body over 1 MiB, so unbounded history would eventually fail every call.",
+              type = "integer",
+              default = 10,
+              between = { 1, 100 },
+          } },
+          { session_ttl = {
+              description = "How long a chat's turn history survives on the data plane, in seconds. After this, the next request starts a new conversation.",
+              type = "integer",
+              default = 86400,
+              between = { 60, 604800 },
+          } },
+
+          -- Data plane state and diagnostics ──────────────────────────────
+          { hop_storage_dict = {
+              description = "Name of the nginx shared dictionary holding hop chains and chat history. It must be a dictionary you declare for this plugin, not one Kong manages — those are flushed on reload, erasing history mid-conversation.",
+              type = "string",
+              default = "reva_ai_runtime_authorization",
+          } },
+          { hop_ttl = {
+              description = "How long a hop chain survives on the data plane, in seconds. A chain older than this starts over as a fresh call.",
+              type = "integer",
+              default = 3600,
+              between = { 60, 86400 },
+          } },
+          { forward_traceparent = {
+              description = "Pass the `traceparent` used for the authorization decision on to the upstream service, so one trace id spans the gateway and your backend.",
+              type = "boolean",
+              default = true,
+          } },
+          { debug = {
+              description = "Log each decision and the request sent to Reva Trust Guardian at notice level. Use it while tuning policy; leave it off in production.",
+              type = "boolean",
+              default = false,
+          } },
+
+        },
+      },
+    },
+  },
+}

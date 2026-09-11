@@ -1,0 +1,134 @@
+Reva AI Runtime Authorization (kong-plugin-reva-ai-runtime-authorization) — installation
+==================================================================
+
+Authorizes agent, MCP, A2A and LLM traffic passing through Kong by evaluating
+every call against Reva Trust Guardian.
+
+Requires Kong Gateway 3.12 or later.
+
+
+1. INSTALL THE PLUGIN ON EACH DATA PLANE
+----------------------------------------
+
+In hybrid mode the plugin code must be present on every data plane node; the
+control plane only ever receives schema.lua.
+
+Option A — LuaRocks, from the packed rock:
+
+    luarocks install kong-plugin-reva-ai-runtime-authorization-0.1.0-1.all.rock
+
+Option B — from source:
+
+    luarocks make
+
+Option C — Docker / Kubernetes: copy the plugin into the image and point Kong
+at it.
+
+    COPY kong/plugins/reva-ai-runtime-authorization /opt/kong/kong/plugins/reva-ai-runtime-authorization
+    ENV KONG_LUA_PACKAGE_PATH="/opt/kong/?.lua;;"
+
+
+2. ENABLE IT IN kong.conf
+-------------------------
+
+    plugins = bundled,reva-ai-runtime-authorization
+    nginx_http_lua_shared_dict = reva_ai_runtime_authorization 64m
+
+or as environment variables:
+
+    KONG_PLUGINS=bundled,reva-ai-runtime-authorization
+    KONG_NGINX_HTTP_LUA_SHARED_DICT="reva_ai_runtime_authorization 64m"
+
+The shared dictionary holds hop chains and chat history. It must not be one
+Kong manages itself: kong_db_cache is flushed on every configuration reload,
+which erases conversations in flight. If you name the dictionary something
+other than reva_ai_runtime_authorization, set hop_storage_dict to match.
+
+Restart Kong. A plugin code change requires a restart — Kong loads Lua at
+worker startup, so a configuration sync alone is not enough.
+
+
+3. CONFIGURE
+------------
+
+Two fields are required; everything else has a working default.
+
+    reva_host_url     base URL of your Reva tenant, e.g.
+                      https://api.example.reva.ai
+    auth_token        bearer token Kong presents to Reva Trust Guardian.
+                      Use a vault reference in production.
+
+The plugin always evaluates at /pdp/v2/ai/evaluation on reva_host_url.
+
+On a gateway reachable from an untrusted network, also set:
+
+    identity_source   consumer
+
+so the calling agent is taken from an authenticated Kong Consumer rather than
+from the X-Reva-Agent-Id header, which any caller can set.
+
+Declarative (decK) example, applied globally:
+
+    _format_version: "3.0"
+    plugins:
+      - name: reva-ai-runtime-authorization
+        config:
+          reva_host_url: https://api.example.reva.ai
+          auth_token: ${{ env "DECK_REVA_AUTH_TOKEN" }}
+
+Admin API example:
+
+    curl -i -X POST http://localhost:8001/plugins/ \
+      --header "Content-Type: application/json" \
+      --data '{"name":"reva-ai-runtime-authorization","config":{
+                "reva_host_url":"https://api.example.reva.ai",
+                "auth_token":"'"$REVA_AUTH_TOKEN"'"}}'
+
+auth_token is referenceable: in production give it a vault reference, e.g.
+{vault://env/reva-ai-runtime-authorization-token}, rather than a literal.
+
+
+4. REQUEST BUFFERING
+--------------------
+
+The plugin reads the request body, so routes it covers need:
+
+    request_buffering: true
+
+MCP endpoints stream over SSE and additionally need:
+
+    response_buffering: false
+
+
+5. VERIFY
+---------
+
+Send a call with no Authorization bearer and no X-Reva-User. The plugin should
+reject it itself, which proves it is loaded and running:
+
+    curl -i -X POST http://localhost:8000/llm/chat/completions \
+      -H 'Content-Type: application/json' \
+      -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+
+    HTTP/1.1 401
+    {"message":"Blocked by Reva","reason":"missing Authorization bearer token"}
+
+Then repeat with a JWT (the claim named by jwt_user_claim, default sub) or, if
+the bearer is not a JWT, with X-Reva-User. authorize_agent is false by default,
+so an agent header is not required.
+
+    -H 'Authorization: Bearer <jwt>'
+
+Decisions are logged at info level, one line per call:
+
+    [reva-ai-runtime-authorization] invokeModel gpt-4o allowed=true status=200
+
+KONG_LOG_LEVEL must be info or lower; notice hides the decision trail.
+
+
+6. DOCUMENTATION
+----------------
+
+    README.md     overview, request flow and the full configuration reference
+
+Plugin Hub page: https://developer.konghq.com/plugins/reva-ai-runtime-authorization/
