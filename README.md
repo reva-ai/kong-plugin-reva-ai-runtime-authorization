@@ -1,5 +1,3 @@
-<img src="assets/reva.svg" alt="Reva" width="44">
-
 # Reva AI Runtime Authorization — Kong Gateway plugin
 
 Kong plugin identifier: `reva-ai-runtime-authorization`
