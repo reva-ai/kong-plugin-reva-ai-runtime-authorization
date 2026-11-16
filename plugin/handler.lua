@@ -1,31 +1,72 @@
 -- kong/plugins/reva-ai-runtime-authorization/handler.lua
 --
--- Reva Trust Guardian authorization for Kong Gateway.
+-- Reva Trust Guardian authorization for Kong AI Gateway.
 --
--- One access-phase handler: read the inbound agent call, translate it into a
--- Reva evaluation request, ask the RTG, and either let the request proxy or
--- terminate it. Everything happens in `access` because the plugin makes the
--- HTTP call to Reva itself rather than delegating it to another plugin.
-
-local http  = require "resty.http"
+-- access: classify the call and ask Reva Trust Guardian for a decision. The
+-- prompt is at the root of the request and the Reva fields are in their own
+-- block; an allow returns a transaction token. A token carried in by an
+-- earlier hop goes to Reva as X-Transaction-Token (inbound accepts
+-- X-Transaction-Token or X-REVA-TOKEN), and the token returned on an allow is
+-- forwarded upstream under both names. When an earlier hop's token is present,
+-- no subject or principal is sent, because Reva takes them from the token. The
+-- first call of a turn sends the user from the JWT. Authorization is the
+-- caller's user JWT; X-API-Token is the gateway credential.
+-- response: only the first call of a turn reads the buffered upstream body and
+-- reports the turn to Reva when that request completes, i.e. when the turn's
+-- answer returns to the caller. Later hops do not report. (No body_filter:
+-- streaming forbids combining it with the response phase.)
+--
+-- A streaming Custom Policy needs KONG_UNTRUSTED_LUA=lax on the data plane so
+-- resty.http and kong.cache are allowed (strict blocks both). The first-call
+-- reservation uses kong.cache (ngx.shared is nil under lax); ngx.shared remains
+-- an optional fallback when untrusted_lua=on.
 local cjson = require "cjson.safe"
+local http  = require "resty.http"
 
 local kong        = kong
 local ngx         = ngx
 local type        = type
 local ipairs      = ipairs
 local tostring    = tostring
+local tonumber    = tonumber
 local setmetatable = setmetatable
 local fmt         = string.format
 local concat      = table.concat
+local lower       = string.lower
 
 local EMPTY_ARRAY = cjson.empty_array
 local ARRAY_MT    = cjson.array_mt
-local RTG_EVAL_PATH             = "/pdp/v2/ai/evaluation"
+local RTG_EVAL_PATH             = "/pdp/ai/access/ai/evaluation"
+local RTG_SUMMARIZE_PATH        = "/pdp/ai/access/ai/trace/summarize"
 local RTG_TIMEOUT_MS            = 5000
+local RTG_SUMMARIZE_TIMEOUT_MS  = 5000
 local RTG_RETRIES               = 2
-local RTG_KEEPALIVE_TIMEOUT     = 60000
-local RTG_KEEPALIVE_POOL_SIZE   = 30
+-- Longest turn output reported to Reva; larger values are rejected.
+local RTG_SUMMARIZE_OUTPUT_MAX  = 16 * 1024
+-- Fixed nginx shared-dict name (must match KONG_NGINX_HTTP_LUA_SHARED_DICT).
+local REVA_SHM_DICT = "reva_ai_runtime_authorization"
+
+
+-- HTTP call to Reva via resty.http (sandbox-allowed). Returns { status, body } or nil, err.
+local function http_request_uri(url, opts)
+  opts = opts or {}
+  local httpc = http.new()
+  httpc:set_timeout(opts.timeout or RTG_TIMEOUT_MS)
+  local ssl_verify = opts.ssl_verify
+  if ssl_verify == nil then
+    ssl_verify = true
+  end
+  local res, err = httpc:request_uri(url, {
+    method = opts.method or "GET",
+    body = opts.body,
+    headers = opts.headers,
+    ssl_verify = ssl_verify,
+  })
+  if not res then
+    return nil, err
+  end
+  return { status = res.status, body = res.body }
+end
 
 
 local RevaRTG = {
@@ -34,7 +75,7 @@ local RevaRTG = {
   -- transformer plugins (request-transformer 801) so we evaluate the request
   -- as the client actually sent it.
   PRIORITY = 1000,
-  VERSION  = "0.1.0",
+  VERSION  = "2.0.0",
 }
 
 
@@ -53,18 +94,28 @@ end
 
 -- W3C traceparent: version-traceid-spanid-flags
 local function mint_traceparent()
+  -- AI Gateway's Lua sandbox omits math.randomseed; guard it.
   if not seeded then
+    if type(math.randomseed) == "function" then
     math.randomseed(ngx.now() * 1000 + ngx.worker.pid())
+    end
     seeded = true
   end
   return "00-" .. hex(16) .. "-" .. hex(8) .. "-01"
 end
 
 
-local function iso_now()
-  -- ngx.utctime, not os.date: streamed plugins run in the Lua sandbox, which
-  -- does not allow the os library.
-  return (ngx.utctime():gsub(" ", "T")) .. "Z"
+-- W3C traceparent → 32-hex trace id (second field). Span id may change per
+-- hop; gateway turn state is keyed on trace_id only.
+local function trace_id_from_traceparent(traceparent)
+  if type(traceparent) ~= "string" or traceparent == "" then
+    return nil
+  end
+  local tid = traceparent:match("^%x%x%-([%x]+)%-")
+  if tid and #tid == 32 then
+    return tid
+  end
+  return nil
 end
 
 
@@ -116,9 +167,8 @@ local function as_array(items)
 end
 
 
--- Walk a dotted path through a table. The path is plugin config
--- (a2a_history_path and friends), not request input, so this is a lookup:
--- "params.history" → root.params.history. Missing segments yield nil.
+-- Walk a dotted path through a table (e.g. JWT claim "realm_access.roles").
+-- Missing segments yield nil.
 local function get_at_path(root, path)
   if type(root) ~= "table" or type(path) ~= "string" or path == "" then
     return nil
@@ -134,72 +184,37 @@ local function get_at_path(root, path)
 end
 
 
--- Resolve the shared dictionary used for hop chains and session history.
---
--- It must NOT be one of Kong's own caches. kong_db_cache is wiped on every
--- config reload, so a Konnect config change silently erases a chat mid
--- conversation: the next message reappears as turn 1 with a fresh startedAt,
--- which reads as the feature not working rather than as state loss.
---
--- Falls back rather than failing, because a gateway that stops authorizing is
--- worse than one that forgets history - but says so, once it matters.
-local warned_fallback = false
-local function reva_shm(conf)
-  -- Streamed plugins under untrusted_lua=lax/strict do not get ngx.shared.
-  -- Indexing it is a 500; hop state just goes missing until the DP uses
-  -- sandbox + KONG_NGINX_HTTP_LUA_SHARED_DICT.
+-- Optional ngx.shared fallback when untrusted_lua=on (nil under lax/strict).
+local warned_shm_fallback = false
+local function reva_shm()
   local shared = ngx and ngx.shared
   if not shared then
     return nil
   end
-  local shm = shared[conf.hop_storage_dict]
+  local shm = shared[REVA_SHM_DICT]
   if shm then
     return shm
   end
   shm = shared["kong_db_cache"]
   if shm then
-    if not warned_fallback then
-      warned_fallback = true
-      kong.log.warn("[reva-ai-runtime-authorization] shared dict '", conf.hop_storage_dict,
-                    "' not declared; falling back to kong_db_cache, which Kong ",
-                    "flushes on every config reload - hop chains and chat ",
-                    "history will be lost when config changes. Declare it with ",
-                    "KONG_NGINX_HTTP_LUA_SHARED_DICT='", conf.hop_storage_dict, " 64m'")
+    if not warned_shm_fallback then
+      warned_shm_fallback = true
+      kong.log.warn("[reva-ai-runtime-authorization] shared dict '", REVA_SHM_DICT,
+                    "' not declared; falling back to kong_db_cache")
     end
     return shm
   end
   return nil
 end
 
-
--- Who is calling, and can we believe them.
---
--- A header is an assertion, not a credential: anyone who can reach the gateway
--- can set X-Reva-Agent-Id to a privileged agent and inherit its policy. The
--- Consumer is different - an authentication plugin resolved it from a real
--- credential before this plugin ran (key-auth is priority 1250, jwt 1450, this
--- is 1000), so it cannot be forged by the caller.
---
--- Returns the agent id, and the source it came from for logging.
-local function resolve_agent(conf)
-  local src = conf.identity_source or "header"
-
-  if src == "consumer" or src == "consumer_then_header" then
-    local consumer = kong.client.get_consumer and kong.client.get_consumer()
-    if consumer then
-      local id = consumer[conf.consumer_id_field or "username"]
-      if id and id ~= "" then
-        return tostring(id), "consumer"
-      end
-    end
-    if src == "consumer" then
-      -- Asked for the trustworthy source and there isn't one. Falling back to
-      -- the header here would quietly undo the whole point of the setting.
-      return "", "consumer-missing"
-    end
+-- Unique id for this Kong request (sandbox may omit ngx.var.request_id).
+local function claim_token()
+  local rid = ngx.var and ngx.var.request_id
+  if type(rid) == "string" and rid ~= "" then
+    return rid
   end
-
-  return kong.request.get_header(conf.agent_header) or "", "header"
+  local pid = (ngx.worker and ngx.worker.pid and ngx.worker.pid()) or 0
+  return fmt("%.6f:%d:%d", ngx.now(), pid, math.random(1, 2147483647))
 end
 
 
@@ -294,10 +309,10 @@ local function claim_array(payload, claim)
 end
 
 
--- User id for principal (and subject when authorize_agent is false), plus
--- the user's groups if the token carries them (conf.jwt_groups_claim).
--- A three-segment Bearer value is treated as a JWT; the configured user
--- claim is required. No fallback: user identity comes only from the JWT.
+-- User id for subject/principal, plus the user's groups if the token carries
+-- them (conf.jwt_groups_claim). A three-segment Bearer value is treated as a
+-- JWT; the configured user claim is required. No fallback: user identity
+-- comes only from the JWT.
 local function resolve_user(conf)
   local token = bearer_token()
   if not token then
@@ -367,96 +382,12 @@ local function last_user_index(messages)
 end
 
 
--- Non-system {role, content} turns, from either an OpenAI messages array or
--- an A2A-shaped history array.
--- `stop_before`, when given, excludes that index and everything after it.
-local function to_history(arr, stop_before)
-  local items = {}
-  if type(arr) ~= "table" then
-    return as_array(items)
-  end
-
-  for i, m in ipairs(arr) do
-    if stop_before and i >= stop_before then
-      break
-    end
-    if type(m) == "table" and m.content ~= nil then
-      local role = m.role or "user"
-      -- Array content is flattened rather than dropped; a multimodal turn is
-      -- still part of the conversation.
-      local content = message_text(m)
-      if role ~= "system" and content then
-        local item = {
-          role    = tostring(role),
-          content = content,
-        }
-        -- A2A gives every message a stable id. chatHistory is exempt from
-        -- managed-Cedar validation, so the extra key is carried through rather
-        -- than normalized away: it lets a policy refer to a specific message
-        -- instead of matching on its text.
-        if m.messageId ~= nil and m.messageId ~= "" then
-          item.messageId = tostring(m.messageId)
-        end
-        items[#items + 1] = item
-      end
-    end
-  end
-
-  return as_array(items)
-end
-
-
--- Pair caller {role, content} history into session.messages request/response
--- turns. A trailing unpaired user message is the current prompt, not history.
-local function utterance(role, content, ts)
-  return {
-    role        = role,
-    contentType = "text/plain",
-    content     = content,
-    timestamp   = ts,
-  }
-end
-
-
-local function history_to_session_messages(arr, now, cap)
-  local out = {}
-  local first_ts = nil
-  if type(arr) ~= "table" then
-    return out, first_ts
-  end
-  local pending
-  for _, m in ipairs(arr) do
-    if type(m) == "table" then
-      local role = m.role or "user"
-      local content = message_text(m)
-      if role ~= "system" and content and content ~= "" then
-        local ts = (type(m.timestamp) == "string" and m.timestamp ~= "" and m.timestamp) or now
-        if role == "user" then
-          pending = { content = content, timestamp = ts }
-          if not first_ts then
-            first_ts = ts
-          end
-        elseif (role == "assistant" or role == "agent") and pending then
-          out[#out + 1] = {
-            turn     = #out + 1,
-            request  = utterance("user", pending.content, pending.timestamp),
-            response = utterance("assistant", content, ts),
-          }
-          pending = nil
-        end
-      end
-    end
-  end
-  cap = cap or 10
-  while #out > cap do
-    table.remove(out, 1)
-  end
-  for i, m in ipairs(out) do
-    m.turn = i
-  end
-  return out, first_ts
-end
-
+-- Text of an A2A message's parts. Both protocol versions are read:
+--   text part  {"text": "..."}, with or without a "kind"/"type" tag
+--   data part  {"data": <any JSON>} (0.3: kind "data"), sent as its JSON text,
+--              capped so one part cannot swamp the evaluation request
+-- File parts carry no readable text and are skipped.
+local A2A_DATA_PART_MAX = 8192
 
 local function a2a_parts_text(value)
   if type(value) == "string" then
@@ -467,41 +398,18 @@ local function a2a_parts_text(value)
   end
   local t = {}
   for _, p in ipairs(value) do
-    if type(p) == "table" and type(p.text) == "string" then
-      t[#t + 1] = p.text
-    end
-  end
-  return concat(t, "\n")
-end
-
-
--- Flatten A2A-shaped history entries (role + parts) to the role/content
--- pairs to_history() already bounds. Callers that store {role, content}
--- at the same path skip this helper.
-local function a2a_messages_to_history(arr)
-  if type(arr) ~= "table" then
-    return nil
-  end
-  local out = {}
-  for _, m in ipairs(arr) do
-    if type(m) == "table" and type(m.parts) == "table" then
-      local text = a2a_parts_text(m.parts)
-      if text ~= "" then
-        out[#out + 1] = {
-          role      = m.role or "user",
-          content   = text,
-          -- carried through so to_history can keep it on the entry
-          messageId = m.messageId,
-        }
+    if type(p) == "table" then
+      if type(p.text) == "string" then
+        t[#t + 1] = p.text
+      elseif p.data ~= nil and p.data ~= ngx.null then
+        local encoded = cjson.encode(p.data)
+        if type(encoded) == "string" and encoded ~= "" then
+          t[#t + 1] = truncate(encoded, A2A_DATA_PART_MAX)
+        end
       end
     end
   end
-  return out
-end
-
-
-local function starts_with(s, prefix)
-  return prefix ~= "" and s:sub(1, #prefix) == prefix
+  return concat(t, "\n")
 end
 
 
@@ -543,17 +451,6 @@ local function kong_service_url()
 end
 
 
--- MCP sniff uses the Service host, not the gateway Host: a shared tunnel
--- would collapse every tool onto one id.
-local function kong_service_host()
-  local svc = kong_service()
-  if svc and type(svc.host) == "string" and svc.host ~= "" then
-    return svc.host
-  end
-  return (kong.request.get_host and kong.request.get_host()) or "unknown-server"
-end
-
-
 local function classify_llm(body)
   local cur = last_user_index(body.messages)
   local prompt = ""
@@ -575,12 +472,11 @@ local function classify_llm(body)
     res_type   = "Model",
     res_id     = model,
     prompt     = prompt,
-    history    = to_history(body.messages, cur),
   }
 end
 
 
-local function classify_mcp(body, http_method, server)
+local function classify_mcp(body, http_method)
   if http_method ~= "POST" then
     return nil, "not an MCP POST"
   end
@@ -588,10 +484,9 @@ local function classify_mcp(body, http_method, server)
     return nil, "MCP method is not tools/call"
   end
 
-  if type(server) ~= "string" or server == "" then
-    server = "unknown-server"
-  end
-
+  -- Tool resource.id is the MCP tool name only (params.name). The Kong
+  -- Service host must not be prefixed: Reva resolves the MCP server from
+  -- resource.endpoint and names the tool <mcp server>/<tool>.
   local tool = body.params and body.params.name
   if type(tool) ~= "string" or tool == "" then
     tool = "unknown-tool"
@@ -607,402 +502,257 @@ local function classify_mcp(body, http_method, server)
     prompt = concat(a, ", ")
   end
 
-  -- A tool call carries no conversation of its own, so the caller has to
-  -- supply it. MCP's own `_meta` is the standard slot for request metadata;
-  -- `metadata` is accepted too, because that is what A2A callers already use
-  -- and having two spellings is cheaper than making every client pick one.
-  -- Without this a tool call reaches the RTG looking like the first thing
-  -- that ever happened, which is precisely the call a policy most needs
-  -- context for: "summarise this invoice" then "refund it" is only alarming
-  -- read together.
-  local meta = (body.params and (body.params._meta or body.params.metadata)) or nil
-  local history = EMPTY_ARRAY
-  if type(meta) == "table" and meta.chatHistory then
-    history = to_history(meta.chatHistory)
-  end
-
+  -- Earlier turns of the chat are kept by Reva, not sent with the tool call.
   return {
     action       = "invokeTool",
     role         = "agent",
     input_values = type(args) == "table" and next(args) ~= nil and args or nil,
     res_type     = "Tool",
-    res_id       = server .. "/" .. tool,
+    res_id       = tool,
     prompt       = prompt,
-    history      = history,
   }
 end
 
 
-local function classify_a2a(conf, body, http_method)
+-- The A2A requests that send a message to an agent, which is what invokes it.
+-- Value: true when the response is streamed (server-sent events).
+--   JSON-RPC, protocol 0.3 names: message/send, message/stream
+--   JSON-RPC, protocol 1.0 names: SendMessage, SendStreamingMessage
+-- Task reads and management (tasks/*, push-notification configs, agent cards)
+-- send no message and are not evaluated.
+local A2A_JSONRPC_SEND = {
+  ["message/send"]         = false,
+  ["SendMessage"]          = false,
+  ["message/stream"]       = true,
+  ["SendStreamingMessage"] = true,
+}
+
+-- The same two operations in the HTTP+JSON (REST) binding, identified by the
+-- end of the request path: the spec puts the operation there, so any prefix
+-- (a version such as /v1, or a tenant) is ignored.
+local A2A_REST_SEND = {
+  { suffix = "/message:send",   streaming = false },
+  { suffix = "/message:stream", streaming = true  },
+}
+
+-- msg: the A2A Message object ({} when the request carried none)
+local function a2a_call(msg, streaming)
+  -- Current utterance from the A2A spec field message.parts.
+  -- Earlier turns of the chat are kept by Reva, not read from the body. The
+  -- thread id is not read here: it comes from conf.session_key (see
+  -- resolve_session_id).
+  return {
+    action    = "invokeAgent",
+    role      = "agent",
+    res_type  = "Agent",
+    res_id    = kong_service_url(),
+    prompt    = a2a_parts_text(msg.parts),
+    streaming = streaming,
+  }
+end
+
+
+local function classify_a2a(body, http_method)
   if http_method ~= "POST" then
     return nil, "not an A2A POST"
   end
-  if (body.method or "") ~= "message/send" then
-    return nil, "A2A method is not message/send"
+  local streaming = A2A_JSONRPC_SEND[body.method or ""]
+  if streaming == nil then
+    return nil, "A2A method does not send a message"
   end
 
-  local msg = (body.params and body.params.message) or {}
-
-  -- Current utterance. Default path is the A2A spec field
-  -- params.message.parts; operators can point this at another slot.
-  local prompt = a2a_parts_text(get_at_path(body, conf.a2a_content_path))
-
-  -- History and routing are Reva extensions, not A2A fields. The paths are
-  -- configurable so a caller that stores them elsewhere can point at them.
-  -- Accept either A2A-shaped messages (role + parts) or {role, content}.
-  local history = EMPTY_ARRAY
-  local raw = (type(msg.metadata) == "table" and msg.metadata.chatHistory) or nil
-  if raw == nil then
-    raw = get_at_path(body, conf.a2a_history_path)
-  end
-  local flat = a2a_messages_to_history(raw)
-  if flat and #flat > 0 then
-    history = to_history(flat)
-  elseif type(raw) == "table" then
-    history = to_history(raw)
-  end
-
-  return {
-    action     = "invokeAgent",
-    role       = "agent",
-    res_type   = "Agent",
-    res_id     = kong_service_url(),
-    prompt     = prompt,
-    history    = history,
-    routing    = get_at_path(body, conf.a2a_routing_path),
-    -- The chat id. `params.contextId` is where the A2A spec puts it;
-    -- `message.contextId` is accepted as well. Without one, every message
-    -- looks like a brand new conversation.
-    session_id = (body.params and body.params.contextId ~= nil
-                  and body.params.contextId ~= "" and body.params.contextId)
-              or (msg.contextId ~= nil and msg.contextId ~= "" and msg.contextId)
-              or nil,
-  }
+  local params = type(body.params) == "table" and body.params or {}
+  local msg = type(params.message) == "table" and params.message or {}
+  return a2a_call(msg, streaming)
 end
 
 
--- JSON-RPC is more specific than a coincidental `messages` key.
-local function sniff_kind(body)
-  if type(body) ~= "table" then
+-- A2A HTTP+JSON binding: POST .../message:send and .../message:stream. The
+-- body is the request itself ({"message": {...}}), with no JSON-RPC envelope.
+local function classify_a2a_rest(body, http_method, path)
+  if http_method ~= "POST" or type(path) ~= "string" then
     return nil
   end
-  if body.jsonrpc ~= nil then
-    if body.method == "tools/call" then
-      return "mcp"
+  for _, op in ipairs(A2A_REST_SEND) do
+    local n = #op.suffix
+    if #path >= n and path:sub(-n) == op.suffix then
+      local msg = type(body.message) == "table" and body.message or {}
+      return a2a_call(msg, op.streaming)
     end
-    if body.method == "message/send" then
-      return "a2a"
-    end
-    return nil
-  end
-  if type(body.messages) == "table" and body.messages[1] ~= nil then
-    return "llm"
   end
   return nil
 end
 
 
--- Work out what the caller is trying to do. Returns a descriptor table, or
+-- Work out what the caller is trying to do from the request body (Kong
+-- Service URL for Agent/Tool endpoint; MCP Tool id is params.name only).
+-- Path prefixes are not used — LLM / MCP / A2A are distinct Kong entities;
+-- the payload shape identifies the call. Returns a descriptor table, or
 -- nil plus a reason when this request is not ours to evaluate.
 --
--- Path prefixes, when enabled, are a type hint. If they do not match, or
--- they are off, the body is sniffed: JSON-RPC tools/call, JSON-RPC
--- message/send, then an OpenAI messages array.
-local function classify(conf, path, method, body)
-  local pid = conf.path_identification or {}
-  if pid.enabled ~= false then
-    if starts_with(path, pid.llm_path_prefix or "/llm") then
-      return classify_llm(body)
-    end
-    if starts_with(path, pid.mcp_path_prefix or "/mcp/") then
-      local prefix = pid.mcp_path_prefix or "/mcp/"
-      local server = path:sub(#prefix + 1):match("^([^/]+)")
-      return classify_mcp(body, method, server)
-    end
-    if starts_with(path, pid.a2a_path_prefix or "/a2a/") then
-      return classify_a2a(conf, body, method)
-    end
+-- Order: JSON-RPC tools/call, JSON-RPC A2A send-message methods, the A2A REST
+-- send-message paths, then OpenAI messages.
+local function classify(conf, method, body, path)
+  local unmatched = "payload is not LLM, MCP tools/call, or an A2A send-message request"
+  if type(body) ~= "table" then
+    return nil, unmatched
   end
-
-  local kind = sniff_kind(body)
-  if kind == "mcp" then
-    return classify_mcp(body, method, kong_service_host())
+  if body.jsonrpc ~= nil then
+    if body.method == "tools/call" then
+      return classify_mcp(body, method)
+    end
+    if A2A_JSONRPC_SEND[body.method or ""] ~= nil then
+      return classify_a2a(body, method)
+    end
+    return nil, "JSON-RPC method is not tools/call or an A2A send-message method"
   end
-  if kind == "a2a" then
-    return classify_a2a(conf, body, method)
+  local rest = classify_a2a_rest(body, method, path)
+  if rest then
+    return rest
   end
-  if kind == "llm" then
+  if type(body.messages) == "table" and body.messages[1] ~= nil then
     return classify_llm(body)
   end
 
-  return nil, "payload is not LLM, MCP tools/call, or A2A message/send"
+  return nil, unmatched
 end
 
 
--- ── hop chain ───────────────────────────────────────────────────────────────
+-- ── per-trace reservation + first-call-only report ──────────────────────────
+--
+-- The key uses the W3C trace id only (the span id may change per hop).
+-- First call versus later hop: the reservation is taken BEFORE the evaluation
+-- call. The winner is the first call of the turn (it reports the turn when it
+-- completes); a loser is a later hop. kong.cache is preferred: get() runs the
+-- loader once per key and concurrent waiters share that value, so the first
+-- hop wins. Fallback: ngx.shared:add when untrusted_lua=on. hop_ttl expires a
+-- reservation whose release never runs. A trace id is always present (created
+-- if absent). The reservation is local to one data plane node.
 
--- Record this call against the traceparent and return the hops that came
--- BEFORE it. The current call is already fully described by subject / action /
--- resource, so repeating it inside context.hops would double-report it. The
--- first call on a fresh traceparent therefore sends hops: [].
--- Returns the prior chain plus its length. The length comes back separately
--- because an empty chain is a cjson sentinel, which has no `#`.
-local function turn_key(traceparent)
-  return "reva:turn:" .. traceparent
+local function entry_key(trace_id)
+  return "reva:entry:" .. trace_id
 end
 
 
--- Everything recorded against this traceparent so far. `hops` is the path
--- taken; `conversation` is what was said on each of those hops. The RTG treats
--- a difference in their lengths as a defect, so they are always read and
--- written together.
-local function read_turn(conf, traceparent)
-  local empty = { hops = {}, conversation = {} }
-  local shm = reva_shm(conf)
-  if not shm then
-    return empty
+-- true = this hop won the claim (entry; summarize on complete).
+local function reserve_entry(conf, trace_id)
+  local key = entry_key(trace_id)
+  local ttl = tonumber(conf.hop_ttl) or 3600
+
+  -- Primary path for AI Gateway lax: kong.cache (not ngx.shared).
+  if kong.cache and kong.cache.get then
+    local me = claim_token()
+    local owner, err = kong.cache:get(
+      key,
+      { ttl = ttl },
+      function(id)
+        return id  -- non-nil; first caller stores its token
+      end,
+      me
+    )
+    if err then
+      kong.log.warn("[reva-ai-runtime-authorization] claim: cache error: ",
+                    tostring(err), " — treating as nested")
+      return false
+    end
+    if owner == me then
+      kong.log.info("[reva-ai-runtime-authorization] claim: RESERVED entry for ",
+                    trace_id, " (kong.cache)")
+      return true
+    end
+    kong.log.info("[reva-ai-runtime-authorization] claim: nested hop for ",
+                  trace_id, " (kong.cache)")
+    return false
   end
-  local raw = shm:get(turn_key(traceparent))
-  local t   = raw and cjson.decode(raw) or nil
-  if type(t) ~= "table" or type(t.hops) ~= "table" then
-    return empty
+
+  -- Fallback when sandbox exposes ngx.shared (untrusted_lua=on).
+  local shm = reva_shm()
+  if shm then
+    local ok = shm:add(key, true, ttl)
+    if ok then
+      kong.log.info("[reva-ai-runtime-authorization] claim: RESERVED entry for ",
+                    trace_id, " (shm)")
+      return true
+    end
+    kong.log.info("[reva-ai-runtime-authorization] claim: nested hop for ",
+                  trace_id, " (shm)")
+    return false
   end
-  t.conversation = type(t.conversation) == "table" and t.conversation or {}
-  return t
+
+  kong.log.warn("[reva-ai-runtime-authorization] claim: no kong.cache and no ",
+                "ngx.shared — cannot know starter; treating as nested")
+  return false
 end
 
 
--- Append an authorized hop and the sentence that went with it, in one write.
--- `response` is left empty: Kong authorizes before the upstream has answered,
--- and the guide is explicit that an empty response means "asked, not yet
--- answered", which is true at this point.
-local function record_turn(conf, traceparent, hop, exchange)
-  local shm = reva_shm(conf)
-  if not shm then
-    kong.log.warn("[reva-ai-runtime-authorization] shared dict '", conf.hop_storage_dict,
-                  "' not found; hop chain will not accumulate")
+-- Drop claim when the turn is done (entry hop completed).
+local function clear_entry(trace_id)
+  if type(trace_id) ~= "string" or trace_id == "" then
     return
   end
+  local key = entry_key(trace_id)
+  if kong.cache then
+    if kong.cache.invalidate_local then
+      kong.cache:invalidate_local(key)
+    elseif kong.cache.invalidate then
+      kong.cache:invalidate(key)
+    end
+  end
+  local shm = reva_shm()
+  if shm then
+    shm:delete(key)
+  end
+  kong.log.info("[reva-ai-runtime-authorization] claim: CLEARED entry for ",
+                trace_id, " (turn complete)")
+end
 
-  local t = read_turn(conf, traceparent)
-  hop.seq      = #t.hops + 1
-  exchange.seq = #t.conversation + 1
-  t.hops[#t.hops + 1] = hop
-  t.conversation[#t.conversation + 1] = exchange
 
-  local encoded = cjson.encode({
-    hops         = as_array(t.hops),
-    conversation = as_array(t.conversation),
-  })
-  if encoded then
-    local ok, err = shm:set(turn_key(traceparent), encoded, conf.hop_ttl)
+-- Entry hop only: buffer the upstream body and summarize in the response
+-- phase (cosockets allowed there; streaming plugins cannot use ngx.timer).
+local function arm_entry_summarize(trace_id, thread_id)
+  if type(trace_id) ~= "string" or trace_id == "" then
+    return
+  end
+  kong.ctx.shared.reva_summarize = true
+  kong.ctx.shared.reva_trace_id  = trace_id
+  kong.ctx.shared.reva_thread_id = thread_id
+  kong.service.request.set_header("Accept-Encoding", "identity")
+  -- Buffered proxying → kong.service.response.get_raw_body() in :response().
+  local ok, err = pcall(function()
+    kong.service.request.enable_buffering()
+  end)
     if not ok then
-      kong.log.warn("[reva-ai-runtime-authorization] could not store turn state: ", err)
-    end
+    kong.log.warn("[reva-ai-runtime-authorization] enable_buffering failed: ",
+                  tostring(err), "; summarize needs buffered response body")
   end
+  kong.log.info("[reva-ai-runtime-authorization] armed summarize for trace_id=",
+                trace_id, " (will POST in response phase)")
 end
 
 
--- Shape stored hops/conversation for the RTG. Older shm rows used a string
--- action and {prompt} instead of {content, contentType}.
-local function hops_for_rtg(entries)
-  local out = {}
-  if type(entries) ~= "table" then
-    return as_array(out)
-  end
-  for i, h in ipairs(entries) do
-    if type(h) == "table" then
-      local action = h.action
-      if type(action) == "string" then
-        action = { name = action }
-      elseif type(action) ~= "table" or type(action.name) ~= "string" then
-        action = { name = "invokeAgent" }
-      else
-        action = { name = tostring(action.name) }
-      end
-      out[#out + 1] = {
-        seq      = h.seq or i,
-        subject  = h.subject,
-        action   = action,
-        resource = h.resource,
-        time     = h.time,
-      }
-    end
-  end
-  return as_array(out)
-end
-
-
-local function conversation_for_rtg(entries)
-  local out = {}
-  if type(entries) ~= "table" then
-    return as_array(out)
-  end
-  for i, e in ipairs(entries) do
-    if type(e) == "table" then
-      local role = e.role or "user"
-      if role == "agent" then
-        role = "assistant"
-      end
-      out[#out + 1] = {
-        seq         = e.seq or i,
-        role        = role,
-        contentType = e.contentType or "text/plain",
-        content     = e.content or e.prompt or "",
-        timestamp   = e.timestamp,
-      }
-    end
-  end
-  return as_array(out)
-end
-
-
--- Kept for the no-shm path so callers still get a well-formed empty chain.
-local function record_hop(conf, traceparent, hop)
-  local shm = reva_shm(conf)
-  if not shm then
-    kong.log.warn("[reva-ai-runtime-authorization] shared dict '", conf.hop_storage_dict,
-                  "' not found; sending empty hop chain")
-    return EMPTY_ARRAY, 0
-  end
-
-  local key  = "reva:hops:" .. traceparent
-  local raw  = shm:get(key)
-  local hops = raw and cjson.decode(raw) or nil
-  if type(hops) ~= "table" then
-    hops = {}
-  end
-
-  -- what the RTG sees: the chain as it stood before this call
-  local prior = {}
-  for i, h in ipairs(hops) do
-    prior[i] = h
-  end
-
-  hop.seq = #hops + 1
-  hops[#hops + 1] = hop
-
-  local encoded = cjson.encode(as_array(hops))
-  if encoded then
-    local ok, err = shm:set(key, encoded, conf.hop_ttl)
-    if not ok then
-      kong.log.warn("[reva-ai-runtime-authorization] could not store hop chain: ", err)
-    end
-  end
-
-  return as_array(prior), #prior
-end
-
-
--- ── session: the turns of one chat ──────────────────────────────────────────
+-- Entry hop of a turn that was allowed (or is proxied anyway).
 --
--- `context.hops` and `context.conversation` reset every turn. `session.messages`
--- only ever grows: one entry per EARLIER turn, as a request/response pair, so
--- turn 3 is judged with turns 1 and 2 in view. "Summarise this policy" followed
--- by "now transfer the funds" is only alarming when read together.
+-- A streamed response (A2A message/stream) is delivered as it is produced, so
+-- it must not be buffered: the client would see nothing until the agent
+-- finished, and a long stream would run into the proxy read timeout. Such a
+-- turn is therefore not summarized (the summary needs the finished body); the
+-- reservation is still held until the request ends so nested hops stay nested.
+local function arm_entry(call, trace_id, thread_id)
+  if call.streaming then
+    kong.ctx.shared.reva_stream_entry = trace_id
+    kong.log.info("[reva-ai-runtime-authorization] streamed entry hop for ", trace_id,
+                  ": response not buffered, turn will not be summarized")
+    return
+  end
+  arm_entry_summarize(trace_id, thread_id)
+end
+
+
+-- ── session id (thread correlation only) ────────────────────────────────────
 --
--- A turn is one user message. We detect the start of one by the hop chain for
--- this traceparent being empty — the app mints a fresh traceparent per message,
--- so an entry hop is a new turn.
---
--- Known limit: this accumulates in the data plane's shared dict, so it is
--- per-node. Two data planes behind a load balancer each see half a chat. The
--- guide's own advice is that the caller should supply session.messages for
--- exactly this reason; doing it here is what makes it work without changing
--- every application, and it is correct for a single gateway.
-
-local function session_key(session_id)
-  return "reva:session:" .. session_id
-end
-
-
-local function read_session(conf, session_id)
-  local empty = { startedAt = nil, turn = 0, messages = {} }
-  if not session_id or session_id == "" then
-    return empty
-  end
-  local shm = reva_shm(conf)
-  if not shm then
-    return empty
-  end
-  local raw = shm:get(session_key(session_id))
-  local s   = raw and cjson.decode(raw) or nil
-  if type(s) ~= "table" then
-    return empty
-  end
-  s.messages = type(s.messages) == "table" and s.messages or {}
-  s.turn     = tonumber(s.turn) or 0
-  return s
-end
-
-
--- Open a new turn: bump the counter and record the user's request with an empty
--- response. The response is filled in by close_turn once the upstream answers.
-local function open_turn(conf, session_id, content, now)
-  local s = read_session(conf, session_id)
-  if not session_id or session_id == "" then
-    return s
-  end
-  local shm = reva_shm(conf)
-  if not shm then
-    return s
-  end
-
-  s.startedAt = s.startedAt or now
-  s.turn      = s.turn + 1
-  s.messages[#s.messages + 1] = {
-    turn    = s.turn,
-    request = {
-      role        = "user",
-      contentType = "text/plain",
-      content     = content,
-      -- Never before the chat began: the RTG refuses the entry hop if
-      -- messages[0].request.timestamp precedes session.startedAt.
-      timestamp   = (s.startedAt and s.startedAt > now) and s.startedAt or now,
-    },
-    response = { role = "assistant", contentType = "text/plain", content = "", timestamp = now },
-  }
-
-  -- Bound it. The RTG rejects a body over 1 MiB BEFORE authorizing, so an
-  -- unbounded history fails every hop of a long chat rather than one.
-  local cap = conf.max_session_messages or 10
-  while #s.messages > cap + 1 do
-    table.remove(s.messages, 1)
-  end
-
-  local encoded = cjson.encode(s)
-  if encoded then
-    local ok, err = shm:set(session_key(session_id), encoded, conf.session_ttl)
-    if not ok then
-      kong.log.warn("[reva-ai-runtime-authorization] could not store session: ", err)
-    end
-  end
-  return s
-end
-
-
--- The turns BEFORE this one, which is what session.messages means. The turn now
--- in flight has no response yet, so it is excluded.
-local function prior_turns(s, cap)
-  local out = {}
-  for i = 1, #s.messages - 1 do
-    local m = s.messages[i]
-    -- A turn whose answer was never captured is not a completed turn, and the
-    -- RTG refuses the whole request over it:
-    --   400 invalid session: session.messages[N].response.content is required
-    -- Dropping it costs one turn of history; sending it costs the call.
-    local resp = m.response
-    if type(resp) == "table" and type(resp.content) == "string"
-       and resp.content ~= "" then
-      out[#out + 1] = m
-    end
-  end
-  while #out > cap do
-    table.remove(out, 1)
-  end
-  return out
-end
-
+-- Earlier turns of the chat are not stored or forwarded by the policy; Reva
+-- keeps them. The policy passes the thread id (threadId and session.id) so Reva
+-- can join the call to the right conversation.
 
 -- ── credential ──────────────────────────────────────────────────────────────
 
@@ -1014,54 +764,217 @@ local function rtg_credential(conf)
 end
 
 
--- ── RTG call ────────────────────────────────────────────────────────────────
+-- ── Reva call ────────────────────────────────────────────────────────────────
 
-local function call_rtg(conf, payload, traceparent, request_id)
-  local url = conf.reva_host_url:gsub("/+$", "") .. RTG_EVAL_PATH
+-- Header value with an optional Bearer prefix removed.
+local function header_token(name)
+  local raw = kong.request.get_header(name)
+  if type(raw) ~= "string" then
+    return ""
+  end
+  raw = raw:gsub("^%s+", ""):gsub("%s+$", "")
+  local bearer = raw:match("^[Bb]earer%s+(.+)$")
+  if bearer then
+    raw = bearer:gsub("^%s+", ""):gsub("%s+$", "")
+  end
+  return raw
+end
+
+
+-- Prior-hop transaction token from the caller. X-Transaction-Token is preferred.
+local function inbound_txn_token()
+  local txn = header_token("x-transaction-token")
+  if txn ~= "" then
+    return txn
+  end
+  return header_token("x-reva-token")
+end
+
+
+-- A string or number as a non-empty string, otherwise nil.
+local function scalar_string(v)
+  if v == nil or v == "" then
+    return nil
+  end
+  if type(v) == "string" or type(v) == "number" then
+    return tostring(v)
+  end
+  return nil
+end
+
+
+-- Thread id: conf.session_key, and nowhere else.
+--   1. the request header of that name;
+--   2. the JSON body at that name. A key with dots is a path from the root of
+--      the body ("params.thread_id" is body.params.thread_id); a key with none
+--      is a top-level field. A top-level field whose name literally contains
+--      dots is also accepted.
+-- No other part of the request is searched: not the A2A contextId, not
+-- mcp-session-id. Point session_key at whichever the caller actually sends,
+-- for example "params.message.contextId".
+local function resolve_session_id(conf, body)
+  local key = conf and conf.session_key
+  if type(key) ~= "string" or key == "" then
+    key = "X-Reva-Session-Id"
+  end
+
+  local from_hdr = scalar_string(kong.request.get_header(key))
+  if from_hdr then
+    return from_hdr
+  end
+
+  if type(body) ~= "table" then
+    return nil
+  end
+  return scalar_string(body[key]) or scalar_string(get_at_path(body, key))
+end
+
+
+local function looks_like_jwt(token)
+  return type(token) == "string" and token:match("^[^%.]+%.[^%.]+%.[^%.]+$") ~= nil
+end
+
+
+-- conf.reva_host is optional (schema default api.reva.ai). Host-only values
+-- get https:// so resty.http can call them.
+local function reva_base_url(conf)
+  local host = conf and conf.reva_host
+  if type(host) ~= "string" or host == "" then
+    host = "api.reva.ai"
+  end
+  host = host:gsub("/+$", "")
+  if not host:find("^https?://") then
+    host = "https://" .. host
+  end
+  return host
+end
+
+
+local function call_rtg(conf, payload, traceparent, request_id, user_bearer, txn_token, thread_id)
+  local url = reva_base_url(conf) .. RTG_EVAL_PATH
 
   local token, terr = rtg_credential(conf)
   if not token then
     return nil, terr
   end
 
+  -- X-API-Token is the gateway credential. X-Reva-Token-Request asks Reva to
+  -- return a transaction token on an allow. Authorization is the user access
+  -- JWT. An earlier hop's token is sent as X-Transaction-Token; Reva takes the
+  -- nested hop's subject (the calling agent) from it.
+  local headers = {
+      ["Content-Type"]          = "application/json",
+    ["X-API-Token"]           = "Bearer " .. token,
+    ["X-Reva-Token-Request"]  = "transaction",
+      ["traceparent"]           = traceparent,
+      ["x-ms-correlation-id"]   = request_id,
+  }
+  if looks_like_jwt(user_bearer) then
+    headers["Authorization"] = "Bearer " .. user_bearer
+  end
+  if type(txn_token) == "string" and txn_token ~= "" then
+    headers["X-Transaction-Token"] = txn_token
+  end
+  if type(thread_id) == "string" and thread_id ~= "" then
+    headers["X-Reva-Thread-Id"] = thread_id
+  end
+
   local opts = {
-    method  = "POST",
-    body    = payload,
-    headers = {
-      ["Content-Type"]        = "application/json",
-      ["Authorization"]       = "Bearer " .. token,
-      ["traceparent"]         = traceparent,
-      ["x-ms-correlation-id"] = request_id,
-    },
-    ssl_verify        = conf.ssl_verify,
-    keepalive_timeout = RTG_KEEPALIVE_TIMEOUT,
-    keepalive_pool    = RTG_KEEPALIVE_POOL_SIZE,
+    method     = "POST",
+    body       = payload,
+    headers    = headers,
+    timeout    = RTG_TIMEOUT_MS,
+    ssl_verify = conf.ssl_verify,
   }
 
   local last_err
   for attempt = 0, RTG_RETRIES do
-    local httpc, err = http.new()
-    if not httpc then
-      last_err = err or "could not create http client"
-
-    else
-      httpc:set_timeout(RTG_TIMEOUT_MS)
-
-      local res, rerr = httpc:request_uri(url, opts)
+    local res, rerr = http_request_uri(url, opts)
       if res then
         return res
-      else
+    end
         last_err = rerr
         kong.log.warn("[reva-ai-runtime-authorization] RTG call attempt ", attempt + 1, " failed: ", rerr)
       end
-    end
-  end
 
   return nil, last_err
 end
 
 
--- The RTG answers a denial with HTTP 403 and a body carrying decision:false,
+-- Best-effort report of one finished chat turn to Reva. It never fails the
+-- client request.
+-- Synchronous HTTP (no ngx.timer): streaming Custom Policies forbid timers,
+-- and the Kong response phase allows cosockets when buffering is enabled.
+local function summarize_trace(conf, trace_id, thread_id, output)
+  if conf.debug then
+    kong.log.notice("[reva-ai-runtime-authorization] summarize: ENTER trace_id=",
+                    tostring(trace_id), " thread_id=", tostring(thread_id),
+                    " output_bytes=", tostring(type(output) == "string" and #output or 0))
+  end
+
+  if type(trace_id) ~= "string" or trace_id == "" then
+    kong.log.warn("[reva-ai-runtime-authorization] summarize: SKIP empty trace_id")
+    return
+  end
+
+  local token, terr = rtg_credential(conf)
+  if not token then
+    kong.log.warn("[reva-ai-runtime-authorization] summarize: SKIP no credential: ", terr)
+    return
+  end
+
+  local body = { trace_id = trace_id }
+  if type(thread_id) == "string" and thread_id ~= "" then
+    body.thread_id = thread_id
+  end
+  if type(output) == "string" and output ~= "" then
+    body.output = truncate(output, RTG_SUMMARIZE_OUTPUT_MAX)
+  end
+
+  local payload = cjson.encode(body)
+  if not payload then
+    kong.log.warn("[reva-ai-runtime-authorization] summarize: SKIP could not encode body")
+    return
+  end
+
+  local url = reva_base_url(conf) .. RTG_SUMMARIZE_PATH
+  local output_bytes = type(body.output) == "string" and #body.output or 0
+
+  local headers = {
+    ["Content-Type"]  = "application/json",
+    ["Authorization"] = "Bearer " .. token,
+    ["X-API-Origin-App"] = "KONG",
+  }
+  if body.thread_id then
+    headers["X-Reva-Thread-Id"] = body.thread_id
+  end
+
+  kong.log.info("[reva-ai-runtime-authorization] summarize: POST ", url,
+                " trace_id=", trace_id)
+
+  local res, rerr = http_request_uri(url, {
+    method     = "POST",
+    body       = payload,
+    headers    = headers,
+    timeout    = RTG_SUMMARIZE_TIMEOUT_MS,
+    ssl_verify = conf.ssl_verify,
+  })
+  if not res then
+    kong.log.warn("[reva-ai-runtime-authorization] summarize: HTTP FAIL ", rerr)
+    return
+  end
+  if res.status == 202 then
+    kong.log.info("[reva-ai-runtime-authorization] summarize: ACCEPTED 202 trace_id=",
+                  trace_id, " output_bytes=", tostring(output_bytes))
+  else
+    kong.log.warn("[reva-ai-runtime-authorization] summarize: HTTP ", res.status,
+                  " for trace_id=", trace_id, " body=",
+                  truncate(tostring(res.body or ""), 300))
+  end
+end
+
+
+-- Reva Trust Guardian answers a denial with HTTP 403 and a body carrying decision:false,
 -- so a non-2xx status is not automatically a service failure. 200 and 403 are
 -- both real decisions; anything else means we could not get one, and the
 -- body's reason is surfaced so the cause is diagnosable.
@@ -1074,8 +987,7 @@ local function decision_from(res)
       return decoded.decision == true, nil, decoded
     end
     if type(body) == "string" then
-      -- Defensive fallback: the RTG has been seen to return a body that does
-      -- not decode cleanly.
+      -- Defensive fallback for a response body that does not decode cleanly.
       return body:find('"decision"%s*:%s*true') ~= nil, nil, nil
     end
     return nil, "empty RTG response body"
@@ -1098,16 +1010,39 @@ end
 
 -- ── phase handler ───────────────────────────────────────────────────────────
 
+-- Request body decoded as JSON when its media type is a JSON one that Kong's
+-- own parser does not handle (application/a2a+json, application/*+json).
+-- Returns nil for anything else, or when the body is unavailable (for example
+-- larger than Kong's in-memory buffer) or not a JSON object or array.
+local function json_body_from_raw()
+  local content_type = kong.request.get_header("content-type")
+  if type(content_type) ~= "string" or not content_type:lower():find("json", 1, true) then
+    return nil
+  end
+  local ok, raw = pcall(kong.request.get_raw_body)
+  if not ok or type(raw) ~= "string" or raw == "" then
+    return nil
+  end
+  local decoded = cjson.decode(raw)
+  if type(decoded) == "table" then
+    return decoded
+  end
+  return nil
+end
+
+
 function RevaRTG:access(conf)
   local path   = kong.request.get_path() or ""
   local method = kong.request.get_method() or "GET"
 
   local ok, body = pcall(kong.request.get_body)
   if not ok or type(body) ~= "table" then
-    body = {}
+    -- Kong parses only application/json. A2A over HTTP+JSON uses
+    -- application/a2a+json, so read any JSON media type ourselves.
+    body = json_body_from_raw() or {}
   end
 
-  local call, skip_reason = classify(conf, path, method, body)
+  local call, skip_reason = classify(conf, method, body, path)
   if not call then
     if conf.debug then
       kong.log.notice("[reva-ai-runtime-authorization] skipping ", method, " ", path, ": ", skip_reason)
@@ -1115,9 +1050,8 @@ function RevaRTG:access(conf)
     return
   end
 
-  -- Identity. User always comes from the JWT. Agent is required only when
-  -- authorize_agent is true.
-  local user, user_err, user_groups = resolve_user(conf)
+  -- Token evaluation takes the user from the JWT as subject/principal.
+  local user, user_err = resolve_user(conf)
   if user == "" then
     return kong.response.exit(401, {
       message = conf.deny_message,
@@ -1125,162 +1059,102 @@ function RevaRTG:access(conf)
     })
   end
 
-  local agent, agent_src = "", "skipped"
-  if conf.authorize_agent then
-    agent, agent_src = resolve_agent(conf)
-    if agent_src == "consumer-missing" then
-      return kong.response.exit(401, {
-        message = conf.deny_message,
-        reason  = "no authenticated consumer; identity_source is 'consumer' so the caller must be authenticated first",
-      })
-    end
-    if agent == "" then
-      if conf.require_identity_headers then
-        return kong.response.exit(400, {
-          message = conf.deny_message,
-          reason  = fmt("missing %s header", conf.agent_header),
-        })
-      end
-      if conf.debug then
-        kong.log.notice("[reva-ai-runtime-authorization] no agent identity; skipping evaluation")
-      end
-      return
-    end
-  end
-
-  if conf.debug then
-    kong.log.notice("[reva-ai-runtime-authorization] user '", user, "' agent '", agent, "' from ", agent_src)
-  end
-
   -- Trace correlation: reuse the caller's traceparent so a multi-agent chain
-  -- keeps one id, otherwise mint one for this entry point.
+  -- keeps one id, otherwise mint one for this entry point. Entry reservation
+  -- is keyed on trace-id only — span id may change per hop under W3C.
   local traceparent = kong.request.get_header("traceparent")
                    or kong.request.get_header("fly-traceparent")
                    or ""
   if traceparent == "" then
     traceparent = mint_traceparent()
   end
+  local trace_id = trace_id_from_traceparent(traceparent)
+  if not trace_id then
+    -- Malformed inbound header: mint a valid one so we still have a trace-id.
+    traceparent = mint_traceparent()
+    trace_id = trace_id_from_traceparent(traceparent)
+  end
 
   local request_id = kong.request.get_header("fly-request-id")
                   or kong.request.get_header("x-request-id")
                   or kong_request_id()
 
-  local source_ip = kong.request.get_header("fly-client-ip")
-                 or kong_client_ip()
+  -- Thread id the caller supplied on this request (not local chat history).
+  -- conf.session_key is searched in the request header and the JSON body.
+  -- It is only SENT to Reva on the first hop of a turn (see thread_id below).
+  local session_id = resolve_session_id(conf, body)
 
-  local now = iso_now()
-  -- Session tracking (and the shared-dict storage it costs) is opt-in with
-  -- authorize_agent: leave session_id nil and every downstream read/write
-  -- of it already no-ops exactly as it does today when a caller sends no
-  -- session header at all — open_turn/read_session both treat a missing
-  -- session_id as "nothing to look up, nothing to store."
-  local session_id
-  if conf.authorize_agent then
-    -- Prefer an explicit chat id from the caller: it is the only thing that
-    -- survives across turns. The others identify a single request, so
-    -- falling back to them makes every message look like a brand new chat.
-    session_id = kong.request.get_header(conf.session_header)
-              or call.session_id
-              or kong.request.get_header("mcp-session-id")
-              or request_id
-  end
-
-  -- The chain as it stood BEFORE this call. This hop is added only after the
-  -- RTG authorizes it, so a refused call never appears in the path that later
-  -- hops are judged against.
-  local turn = read_turn(conf, traceparent)
-  local prior_hop_count = #turn.hops
-  local hops = hops_for_rtg(turn.hops)
-  local conversation = conversation_for_rtg(turn.conversation)
+  -- Reserve entry BEFORE the evaluation call so a nested hop cannot steal "first"
+  -- while we are still in call_rtg.
+  local is_entry_hop = reserve_entry(conf, trace_id)
 
   local prompt = call.prompt or ""
   if prompt == "" then
     prompt = call.action .. " " .. call.res_id
   end
 
-  -- First hop of a turn: the hop chain for this traceparent is still empty.
-  local is_entry_hop = (prior_hop_count == 0)
-
-  local sess
-  if is_entry_hop then
-    sess = open_turn(conf, session_id, prompt, now)
-  else
-    sess = read_session(conf, session_id)
+  -- Token evaluation body: business prompt at the root, Reva fields under rtg/a2a.
+  local prompt_key = conf.prompt_key
+  if type(prompt_key) ~= "string" or prompt_key == "" then
+    prompt_key = "content"
   end
 
-  local cap = conf.max_session_messages or 10
-  local caller_pairs, hist_started = history_to_session_messages(call.history, now, cap)
+  local resource = { type = call.res_type, id = call.res_id }
+  if call.action == "invokeAgent" or call.action == "invokeTool" then
+    resource.endpoint = kong_service_url()
+  end
 
-  local session_block = {
-    id        = session_id,
-    startedAt = sess.startedAt or now,
+  -- Later hops carry X-Transaction-Token; Reva derives the subject (the
+  -- token's agent) and the principal from it, so no subject or principal is
+  -- sent. The first call of a turn (no prior token) sends the User from the JWT.
+  --
+  -- transmission.role is the speaker Reva records for the turn. Earlier user
+  -- requests are recalled only from hops with role=user, so the first call (the
+  -- end user's utterance) is "user". Later hops stay "agent".
+  local prior_txn = inbound_txn_token()
+  local hop_role = "agent"
+  if prior_txn == "" then
+    hop_role = "user"
+  elseif type(call.role) == "string" and call.role ~= "" then
+    hop_role = call.role
+  end
+  local a2a = {
+    action   = { name = call.action },
+    resource = resource,
+    transmission = {
+      promptKey = prompt_key,
+      role      = hop_role,
+      content   = prompt,
+    },
   }
-  if #caller_pairs > 0 then
-    session_block.turn = #caller_pairs + 1
-    session_block.startedAt = hist_started or session_block.startedAt
-    if session_block.turn >= 2 then
-      session_block.messages = caller_pairs
-    end
+  if prior_txn == "" then
+    a2a.subject   = { type = "User", id = user }
+    a2a.principal = { type = "User", id = user }
   else
-    session_block.turn = (sess.turn and sess.turn > 0) and sess.turn or (prior_hop_count + 1)
-    local earlier = prior_turns(sess, cap)
-    if #earlier > 0 and session_block.turn >= 2 then
-      session_block.messages = earlier
-    end
+    kong.log.info("[reva-ai-runtime-authorization] nested hop: omitting body subject/principal; ",
+                  "prior txn token present (", #prior_txn, " bytes)")
+  end
+  -- The thread is recorded on the first hop of a turn only. A later hop
+  -- carries the prior transaction token and Reva joins it to the thread through
+  -- the trace id, so sending the thread id again could only split the thread
+  -- when a hop carries a different one.
+  --
+  -- Reva stamps the decision log's thread id from threadId only. session.id is
+  -- kept for callers that still read it; X-Reva-Thread-Id is also set in
+  -- call_rtg.
+  local thread_id = nil
+  if prior_txn == "" and type(session_id) == "string" and session_id ~= "" then
+    thread_id = session_id
+    a2a.threadId = thread_id
+    a2a.session  = { id = thread_id }
+  elseif prior_txn ~= "" and type(session_id) == "string" and session_id ~= "" then
+    kong.log.info("[reva-ai-runtime-authorization] nested hop: thread id ", session_id,
+                  " not sent; Reva joins this hop to its thread through the trace")
   end
 
-  -- History lives only in session.messages, never duplicated into context.
-  -- context.conversation is this turn's own hop-by-hop record; it is not a
-  -- second copy of the chat history.
-  local context = {
-    hops         = hops,
-    maxHops      = call.routing and tonumber(call.routing.maxHops) or nil,
-    conversation = { messages = conversation },
-  }
-
-  -- The entry hop of a trace is the user's own action, whoever relayed it -
-  -- rec_hop below already records it this way. Only a later hop, where some
-  -- prior hop exists for this traceparent, is a real agent acting on its own.
-  local subject
-  if conf.authorize_agent and not is_entry_hop then
-    subject = { type = "Agent", id = agent }
-  else
-    subject = { type = "User", id = user }
-  end
-
-  local tx = {
-    promptKey   = conf.prompt_key,
-    role        = is_entry_hop and "user" or "assistant",
-    contentType = "text/plain",
-  }
-  tx[conf.prompt_key or "content"] = prompt
-
-  -- The User's group memberships (e.g. Cognito's "cognito:groups"), as a
-  -- Cedar-style entity: the policy resolves group membership by walking
-  -- `parents`, not by reading a plain list off the request.
-  local entities
-  if user_groups and #user_groups > 0 then
-    local parents = {}
-    for i, group in ipairs(user_groups) do
-      parents[i] = { type = "UserGroup", id = group }
-    end
-    entities = as_array({ {
-      uid     = { type = "User", id = user },
-      parents = parents,
-    } })
-  end
-
-  local payload = cjson.encode({
-    subject      = subject,
-    action       = { name = call.action },
-    resource     = { type = call.res_type, id = call.res_id, name = call.res_id },
-    principal    = { type = "User", id = user },
-    context      = context,
-    transmission = tx,
-    session      = session_block,
-    inputValues  = call.input_values,
-    entities     = entities,
-  })
+  local root = { ["rtg/a2a"] = a2a }
+  root[prompt_key] = prompt
+  local payload = cjson.encode(root)
 
   if not payload then
     kong.log.err("[reva-ai-runtime-authorization] could not encode evaluation request")
@@ -1293,13 +1167,14 @@ function RevaRTG:access(conf)
     })
   end
 
-  if conf.debug then
-    kong.log.notice("[reva-ai-runtime-authorization] evaluating ", call.action, " ", call.res_id,
-                    " payload=", payload)
-  end
+  kong.log.notice("[reva-ai-runtime-authorization] evaluating ", call.action, " ", call.res_id,
+                  " payload=", payload)
 
   local started = ngx.now()
-  local res, err = call_rtg(conf, payload, traceparent, request_id)
+  local res, err = call_rtg(conf, payload, traceparent, request_id,
+                            header_token("authorization"),
+                            prior_txn,
+                            thread_id)
   local elapsed_ms = (ngx.now() - started) * 1000
 
   local allowed, decision_err, decoded
@@ -1310,6 +1185,7 @@ function RevaRTG:access(conf)
   end
 
   kong.ctx.shared.reva_traceparent = traceparent
+  kong.ctx.shared.reva_trace_id    = trace_id
   kong.ctx.shared.reva_allowed     = allowed
   kong.ctx.shared.reva_latency_ms  = elapsed_ms
 
@@ -1317,6 +1193,13 @@ function RevaRTG:access(conf)
     kong.log.err("[reva-ai-runtime-authorization] no decision (", decision_err, ") after ",
                  fmt("%.1f", elapsed_ms), "ms; fail_open=", tostring(conf.fail_open))
     if conf.fail_open then
+      -- Proxying without a decision: keep reservation so nested hops stay nested.
+      if conf.forward_traceparent then
+        kong.service.request.set_header("traceparent", traceparent)
+      end
+      if is_entry_hop then
+        arm_entry(call, trace_id, thread_id)
+      end
       return
     end
     return kong.response.exit(conf.deny_status, {
@@ -1342,9 +1225,10 @@ function RevaRTG:access(conf)
     -- log level that is kept, and marked so nobody reads it as an allow.
     if conf.monitor_mode then
       kong.log.warn("[reva-ai-runtime-authorization] MONITOR would deny ", call.action, " ", call.res_id,
-                    " for ", agent, ": ", reason, " (proxying anyway)")
+                    " for ", user, ": ", reason, " (proxying anyway)")
       kong.ctx.shared.reva_monitor_would_deny = true
     else
+      -- No summarize/clear on deny; hop_ttl GC. Next turn mints a new TP.
       return kong.response.exit(conf.deny_status, {
         message = conf.deny_message,
         reason  = reason,
@@ -1352,99 +1236,38 @@ function RevaRTG:access(conf)
     end
   end
 
-  -- Authorized, so this hop now becomes part of the path that later hops in
-  -- the same trace are judged against. A refused call is never recorded.
-  local rec_hop, rec_ex
-  if conf.authorize_agent then
-    if is_entry_hop then
-      rec_hop = {
-        subject  = { type = "User", id = user },
-        action   = { name = "invokeAgent" },
-        resource = { type = "Agent", id = agent },
-        time     = now,
-      }
-      rec_ex = utterance("user", prompt, now)
-    else
-      rec_hop = {
-        subject  = { type = "Agent", id = agent },
-        action   = { name = call.action },
-        resource = { type = call.res_type, id = call.res_id },
-        time     = now,
-      }
-      rec_ex = utterance("assistant", prompt, now)
-    end
+  -- Authorized (or monitor-proxying). Only the entry hop summarizes when this
+  -- HTTP request completes (answer back to the turn's caller).
+  kong.log.info("[reva-ai-runtime-authorization] after-allow action=", call.action,
+                " res=", call.res_id,
+                " is_entry_hop=", tostring(is_entry_hop),
+                " trace_id=", tostring(trace_id),
+                " thread_id=", tostring(thread_id))
+
+  local minted = decoded and decoded.token
+  if type(minted) == "string" and minted ~= "" then
+    -- Forward under both header names so a caller can pass the next hop on either.
+    kong.service.request.set_header("X-Transaction-Token", minted)
+    kong.service.request.set_header("X-REVA-TOKEN", minted)
   else
-    rec_hop = {
-      subject  = { type = "User", id = user },
-      action   = { name = call.action },
-      resource = { type = call.res_type, id = call.res_id },
-      time     = now,
-    }
-    rec_ex = utterance(is_entry_hop and "user" or "assistant", prompt, now)
+    kong.log.warn("[reva-ai-runtime-authorization] token evaluation allow returned no transaction token for ",
+                  call.action, " ", call.res_id)
   end
-  record_turn(conf, traceparent, rec_hop, rec_ex)
 
   if conf.forward_traceparent then
     kong.service.request.set_header("traceparent", traceparent)
   end
 
-  -- Only the hop that opened a turn closes it, and only that hop needs the
-  -- response body buffered.
-  -- Capture the response on every hop of the turn, not only the one that
-  -- opened it. The hop that opens a turn is often the model returning a tool
-  -- call, and a completion carrying tool_calls has content: null - there is
-  -- nothing to record yet. The turn's actual answer arrives on its last hop, so
-  -- each hop overwrites the previous one and the final write is the real reply.
-  if session_id and session_id ~= "" and sess.turn > 0 then
-    kong.ctx.shared.reva_session_id = session_id
-    kong.ctx.shared.reva_open_turn  = sess.turn
-    -- Ask the upstream not to compress THIS response. body_filter sees the raw
-    -- stream, and gzip bytes stored as a turn's answer are unreadable to the
-    -- evaluator and inflate the payload toward the RTG's 1 MiB limit. Kong has
-    -- no gunzip primitive, so the cheaper fix is to not receive gzip at all.
-    -- Scoped to the one hop per turn whose body we actually read.
-    kong.service.request.set_header("Accept-Encoding", "identity")
+  if is_entry_hop then
+    arm_entry(call, trace_id, thread_id)
   end
 end
 
 
--- Buffer the response body, but only for the hop that opened a turn. Every
--- other hop pays nothing.
-function RevaRTG:body_filter(conf)
-  if not kong.ctx.shared.reva_open_turn then
-    return
+local function extract_assistant_text(body)
+  if type(body) ~= "string" or body == "" then
+    return nil
   end
-
-  local chunk, eof = ngx.arg[1], ngx.arg[2]
-  local buf = kong.ctx.shared.reva_body_buf or {}
-  if chunk and chunk ~= "" and #buf < 64 then
-    buf[#buf + 1] = chunk
-    kong.ctx.shared.reva_body_buf = buf
-  end
-  if eof then
-    kong.ctx.shared.reva_body_done = table.concat(buf)
-  end
-end
-
-
--- Close the turn: write the answer into the turn this request opened, so the
--- NEXT turn of the chat carries a complete request/response pair: the broad
--- user query and its response, not a replay of all ten hops in between.
-function RevaRTG:log(conf)
-  local session_id = kong.ctx.shared.reva_session_id
-  local turn_no    = kong.ctx.shared.reva_open_turn
-  if not session_id or not turn_no then
-    return
-  end
-
-  local body = kong.ctx.shared.reva_body_done
-  if not body or body == "" then
-    return
-  end
-
-  -- Pull the assistant's sentence out of an OpenAI-style completion; fall back
-  -- to the raw body for anything else. Truncated hard: this is a summary line,
-  -- and the whole history ships on every later hop.
   local text
   local ok, decoded = pcall(cjson.decode, body)
   if ok and type(decoded) == "table" then
@@ -1452,17 +1275,10 @@ function RevaRTG:log(conf)
     if type(choices) == "table" and type(choices[1]) == "table"
        and type(choices[1].message) == "table" then
       text = choices[1].message.content
-
-    -- JSON-RPC, which is what MCP tool results and A2A messages come back as.
-    -- Without this branch those turns never record an answer, prior_turns()
-    -- drops them as incomplete, and session.messages stays empty for every
-    -- call type except the model ones.
     elseif decoded.jsonrpc then
       local r = decoded.result
       if type(r) == "table" then
-        -- MCP tools/call: { content = [ { type = "text", text = "..." } ] }
         local parts = type(r.content) == "table" and r.content or nil
-        -- A2A message/send: { parts = [ { text = "..." } ] }
         if not parts and type(r.parts) == "table" then
           parts = r.parts
         end
@@ -1477,8 +1293,6 @@ function RevaRTG:log(conf)
             text = concat(acc, "\n")
           end
         end
-        -- Anything else structured: report it as JSON rather than nothing. An
-        -- absent response costs the turn; a compact encoding of it does not.
         if not text then
           local enc_ok, enc = pcall(cjson.encode, r)
           if enc_ok then
@@ -1488,49 +1302,67 @@ function RevaRTG:log(conf)
       elseif type(r) == "string" then
         text = r
       elseif type(decoded.error) == "table" then
-        -- A failed tool call is still what happened on that turn.
         text = "error: " .. tostring(decoded.error.message or "unknown")
       end
     end
   end
+  if type(text) == "string" and text ~= "" then
+    return text
+  end
+  return nil
+end
 
-  -- Store nothing rather than something unreadable. A body that did not parse
-  -- is compressed, streamed, or some shape we do not know; writing those bytes
-  -- in as the turn's answer tells the evaluator the agent said a page of
-  -- binary. An absent response honestly means "not captured".
-  if type(text) ~= "string" or text == "" then
-    if conf.debug then
-      kong.log.notice("[reva-ai-runtime-authorization] no readable response for turn ", turn_no,
-                      "; leaving it empty")
+
+-- Summarize here: enable_buffering + get_raw_body. Cosockets are allowed.
+-- Streaming forbids implementing response together with body_filter/header_filter.
+function RevaRTG:response(conf)
+  if not kong.ctx.shared.reva_summarize or kong.ctx.shared.reva_summarized then
+    return
+  end
+
+  local body
+  local ok, raw = pcall(function()
+    return kong.service.response.get_raw_body()
+  end)
+  if ok and type(raw) == "string" then
+    body = raw
+  end
+
+  local tid = kong.ctx.shared.reva_trace_id
+  local thread = kong.ctx.shared.reva_thread_id
+  local text = extract_assistant_text(body)
+  if conf.debug then
+    kong.log.notice("[reva-ai-runtime-authorization] response-phase summarize trace_id=",
+                    tostring(tid),
+                    " body_bytes=", tostring(body and #body or 0),
+                    " output_bytes=", tostring(type(text) == "string" and #text or 0))
+  end
+  if type(tid) == "string" and tid ~= "" then
+    summarize_trace(conf, tid, thread, text)
+    kong.ctx.shared.reva_summarized = true
+    clear_entry(tid)
     end
+  end
+
+
+-- Clear the entry reservation if response never ran (e.g. early abort).
+-- No HTTP here — cosockets are disabled in log_by_lua*.
+function RevaRTG:log(conf)
+  local stream_tid = kong.ctx.shared.reva_stream_entry
+  if type(stream_tid) == "string" and stream_tid ~= "" then
+    clear_entry(stream_tid)
     return
   end
 
-  local shm = reva_shm(conf)
-  if not shm then
-    return
-  end
-  local raw = shm:get(session_key(session_id))
-  local s   = raw and cjson.decode(raw) or nil
-  if type(s) ~= "table" or type(s.messages) ~= "table" then
+  if not kong.ctx.shared.reva_summarize or kong.ctx.shared.reva_summarized then
     return
   end
 
-  for i = #s.messages, 1, -1 do
-    if s.messages[i].turn == turn_no then
-      s.messages[i].response = {
-        role        = "assistant",
-        contentType = "text/plain",
-        content     = truncate(text, 2000),
-        timestamp   = iso_now(),
-      }
-      break
-    end
-  end
-
-  local encoded = cjson.encode(s)
-  if encoded then
-    shm:set(session_key(session_id), encoded, conf.session_ttl)
+  local tid = kong.ctx.shared.reva_trace_id
+  kong.log.warn("[reva-ai-runtime-authorization] log-phase: summarize did not run ",
+                "in response phase; clearing entry for ", tostring(tid))
+  if type(tid) == "string" and tid ~= "" then
+    clear_entry(tid)
   end
 end
 

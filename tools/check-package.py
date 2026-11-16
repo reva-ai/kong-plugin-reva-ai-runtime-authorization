@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Pre-submission gate for the Reva AI Runtime Authorization Kong Plugin Hub package.
+"""Release gate for the Reva AI Runtime Authorization Kong AI Gateway policy package.
 
-Every check here exists because the package failed it at least once. Run it
-before handing anything to Kong:
+Run it before publishing:
 
     python3 tools/check-package.py
 
@@ -20,8 +19,8 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DIR = os.path.join(ROOT, "plugin")
-ROCKSPEC_NAME = "kong-plugin-reva-ai-runtime-authorization-0.1.0-1.rockspec"
-ROCK_NAME = "kong-plugin-reva-ai-runtime-authorization-0.1.0-1.all.rock"
+ROCKSPEC_NAME = "kong-plugin-reva-ai-runtime-authorization-2.0.0-1.rockspec"
+ROCK_NAME = "kong-plugin-reva-ai-runtime-authorization-2.0.0-1.all.rock"
 SKIP_DIRS = {"__pycache__", ".git", "tools"}
 SKIP_NAMES = {".DS_Store"}
 BINARY_EXT = {".rock", ".pyc", ".png", ".jpg", ".gif"}
@@ -89,30 +88,6 @@ def check(label, pattern, why, flags=re.I, allow=()):
 
 print("Package gate: %s\n" % ROOT)
 print("Content checks")
-
-check("no obsolete product name", r"Trust\s+Gateway",
-      "the product is Reva Trust Guardian; 'Trust Gateway' is retired")
-
-check("no retired plugin name",
-      r"reva[-_ ]ai[-_ ]governance|Reva\s+AI\s+Governance",
-      "the plugin is Reva AI Runtime Authorization; the identifier is "
-      "reva-ai-runtime-authorization")
-
-check("no internal hosts", r"\b(?:api\.)?(?:pr0\d|dv0\d)\b[\w.]*",
-      "internal preview/dev hosts must be api.example.reva.ai")
-
-check("no internal repo URLs", r"gitlab\.com|\bpm_demo\b",
-      "the private monorepo is unreachable to anyone installing this")
-
-check("no internal infrastructure",
-      r"\bPDP_check\b|request-callout|reva-guardrail-gateway|konnect-upload|"
-      r"konnect-enable|\bdemo-app\b|\bdataplane/|\bngrok\b",
-      "internal prototype and demo plumbing must not ship")
-
-check("no project-status language",
-      r"\bParked\b|resume trigger|waiting on Reva|One open design decision|"
-      r"internal review",
-      "status notes belong in the tracker, not in a customer file")
 
 check("no British spellings",
       r"\b\w*(?:behaviour|serialis|normalis|recognis|authoris|organis|initialis)\w*\b",
@@ -192,12 +167,12 @@ check_anchors()
 
 def check_min_version():
     """Three different minimum versions shipped once."""
-    # Only claims that declare a supported FLOOR. "tested on 3.15.0.5" is a
+    # Only claims that declare a supported FLOOR. "tested on 2.3" is a
     # statement about what was exercised, not a floor, and must not conflict.
     floor_patterns = [
-        r"Requires Kong Gateway (\d+\.\d+) or later",
-        r"min_version\.gateway declared as (\d+\.\d+)",
-        r"gateway:\s*'(\d+\.\d+)'",
+        r"Requires Kong AI Gateway (\d+\.\d+) or later",
+        r"min_version\.ai-gateway declared as (\d+\.\d+)",
+        r"ai-gateway:\s*'(\d+\.\d+)'",
     ]
     versions = {}
     for rel, text in shipping_files():

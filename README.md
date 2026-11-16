@@ -1,43 +1,54 @@
-# Reva AI Runtime Authorization — Kong Gateway plugin
+# Reva AI Runtime Authorization — Kong AI Gateway policy
 
-Kong plugin identifier: `reva-ai-runtime-authorization`
+AI Custom Policy name: `reva-ai-runtime-authorization`
 
-Authorizes agent, MCP, A2A and LLM traffic passing through Kong by evaluating
-every call against [Reva Trust Guardian](https://reva.ai), Reva's policy
-decision point. A call is proxied only when policy allows it.
+Authorizes agent, MCP, A2A and LLM traffic passing through Kong AI Gateway by
+evaluating every call against [Reva Trust Guardian](https://reva.ai), Reva's
+policy decision point. A call is proxied only when policy allows it.
 
-Unlike request-level filtering, this plugin evaluates the **delegation chain**:
+Unlike request-level filtering, this policy evaluates the **delegation chain**:
 it correlates the hops of one agent turn on a shared `traceparent` and the turns
 of one chat on a session id, so a policy can be written against what an agent is
 actually doing across a conversation rather than a single request in isolation.
 
-Requires Kong Gateway 3.12 or later.
+Requires Kong AI Gateway 2.2 or later.
 
 ## What's in this repository
 
 | Path | Contents |
 |---|---|
-| `plugin/` | The plugin: `handler.lua`, `schema.lua`, the rockspec, the packed `.all.rock`, and install instructions |
-| `documentation/` | The Kong Plugin Hub page sources — `index.md`, `reference.md`, `schema.json`, the config example and the icon |
+| `plugin/` | The policy: `handler.lua`, `schema.lua`, the rockspec, the packed `.all.rock`, and install instructions |
+| `documentation/` | The documentation page sources — `index.md`, `reference.md`, `schema.json`, the config example and the icon |
 | `tools/` | Build and verification scripts (see below) |
 
 ## Installing
 
-See [`plugin/INSTALL.txt`](plugin/INSTALL.txt). In short:
+See [`plugin/INSTALL.txt`](plugin/INSTALL.txt). Kong AI Gateway runs a custom
+policy in one of two ways; this policy works with either.
+
+**Streaming.** Create an AI Custom Policy in Konnect with `type` `streaming`,
+sending `schema.lua` as the schema and `handler.lua` as the handler. Konnect
+sends the handler to your data planes, so their image does not change. Start
+each data plane with:
+
+```
+KONG_CUSTOM_PLUGIN_STREAMING_ENABLED=on
+KONG_UNTRUSTED_LUA=lax
+```
+
+**Installed.** Put the code on each data plane and send only the schema to
+Konnect (`type` `installed`):
 
 ```sh
-luarocks install kong-plugin-reva-ai-runtime-authorization-0.1.0-1.all.rock
+luarocks install kong-plugin-reva-ai-runtime-authorization-2.0.0-1.all.rock
 ```
 
 then add `reva-ai-runtime-authorization` to the `plugins` directive in
-`kong.conf`, and declare the shared dictionary the plugin needs:
+`kong.conf`.
 
-```
-plugins = bundled,reva-ai-runtime-authorization
-nginx_http_lua_shared_dict = reva_ai_runtime_authorization 64m
-```
-
-Configuration reference: [`plugin/README.md`](plugin/README.md).
+Either way, finish by creating an AI Policy of type
+`reva-ai-runtime-authorization`. Nothing else needs to be declared on the data
+plane. Configuration reference: [`plugin/README.md`](plugin/README.md).
 
 ## Building and verifying
 
@@ -52,10 +63,13 @@ python3 tools/build-rock.py           # repack the .all.rock from plugin/
 python3 tools/apply-tooltips.py tools/tooltips.json   # rewrite field descriptions
 ```
 
+The handler's request classification has an offline test, `tools/test-handler.lua`;
+its header gives the `docker run` command that runs it against the Kong AI Gateway image.
+
 `check-package.py` verifies, among other things, that `schema.json` matches
 `schema.lua`, that the packed rock matches `plugin/`, that both Lua files
-compile under LuaJIT, that the rockspec lints, and that no internal host or
-credential has crept into a shipping file. Install `luajit` and `luarocks` for
+compile under LuaJIT, that the rockspec lints, and that no credential has crept
+into a shipping file. Install `luajit` and `luarocks` for
 the full set; the Lua checks skip with a note if they are absent.
 
 ## Support

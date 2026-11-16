@@ -1,60 +1,56 @@
-description: 'Enable the Reva AI Runtime Authorization plugin.'
+description: 'Attach the Reva AI Runtime Authorization policy.'
 
 extended_description: |
-  Enable the Reva AI Runtime Authorization plugin.
+  Attach the Reva AI Runtime Authorization policy.
 
-  In this example the plugin is enabled globally, so every route on the control
-  plane is authorized against the Reva policy store. Scope it to a Service or
-  Route instead if you only want to govern part of your traffic.
+  In this example the policy is global, so every model, tool and agent call
+  through the AI Gateway is authorized against the Reva policy store. Attach it
+  to an AI Model, AI Consumer or AI Consumer Group instead if you only want to
+  govern part of your traffic.
 
-  If path identification is on (the default), requests under `/llm`, `/mcp/`
-  or `/a2a/` are classified by those prefixes. Other URLs, and installs with
-  path identification off, are classified by sniffing the body.
+  Calls are classified from the request body: OpenAI `messages`, MCP
+  `tools/call`, or an A2A send-message request. Other payloads are proxied
+  untouched.
 
-  This plugin also requires the following {{site.base_gateway}} entity
-  configuration:
-  1. [Set up {{site.ai_gateway}}](/ai-gateway/get-started/) by creating a Service
-     and a Route for each upstream you want governed.
-  1. Enable `request_buffering` on those routes — the plugin reads the request
-     body to classify the call. MCP endpoints stream over SSE and additionally
-     need `response_buffering` disabled.
-  1. [Enable an authentication plugin](/how-to/enable-key-authentication-on-a-service-with-kong-gateway/)
-     in front of the routes this plugin covers, so that only authenticated
-     callers can assert an agent identity.
+  This policy also requires the following {{site.ai_gateway}} configuration:
+  1. [Set up {{site.ai_gateway}}](/ai-gateway/get-started/) with an entity for
+     each upstream you want governed: a model, an MCP server or an agent.
+  1. Keep `request_buffering` enabled on the routes the policy covers — it reads
+     the request body to classify the call. MCP endpoints stream over SSE and
+     additionally need `response_buffering` disabled.
+  1. Authenticate callers before their requests reach the policy, so that each
+     one presents a user JWT.
 
-title: 'Enable Reva AI Runtime Authorization'
+title: 'Attach Reva AI Runtime Authorization'
 
 weight: 900
 
 requirements:
   - "You have an authorization token for Reva Trust Guardian, from the Reva console under **Settings → Connect to Reva Trust Guardian**."
-  - "The Reva AI Runtime Authorization plugin is [installed](/plugins/reva-ai-runtime-authorization/#install-the-reva-ai-runtime-authorization-plugin) on every data plane node."
-  - "The data plane declares a shared dictionary for the plugin: `nginx_http_lua_shared_dict = reva_ai_runtime_authorization 64m`. It must not be one {{site.base_gateway}} manages itself."
+  - "The Reva AI Runtime Authorization AI Custom Policy is [added](/plugins/reva-ai-runtime-authorization/#add-the-reva-ai-runtime-authorization-policy) to your {{site.ai_gateway}}, and every data plane can run it."
 
 variables:
-  reva-host-url:
-    value: $REVA_RTG_BASE_URL
+  reva-host:
+    value: $REVA_HOST
     description: |
-      Reva Host URL, for example `https://api.example.reva.ai`. The plugin
-      evaluates at `/pdp/v2/ai/evaluation` on this host.
+      Reva host, for example `api.example.reva.ai`. Defaults to `api.reva.ai`
+      when omitted.
   auth-token:
     value: $REVA_AUTH_TOKEN
     description: |
-      Token {{site.base_gateway}} presents to the Reva Trust Guardian.
+      Token {{site.ai_gateway}} presents to the Reva Trust Guardian.
       Use a [vault reference](/gateway/entities/vault/) in production rather than
       a literal — the field is referenceable.
 
 config:
-  reva_host_url: ${reva-host-url}
+  reva_host: ${reva-host}
   auth_token: ${auth-token}
   fail_open: false
 
 tools:
-  - deck
-  - admin-api
   - konnect-api
-  - kic
+  - kongctl
   - terraform
 
 min_version:
-  gateway: '3.12'
+  ai-gateway: '2.2'

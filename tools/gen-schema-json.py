@@ -3,7 +3,7 @@
 
 Konnect renders the plugin configuration form from the uploaded schema.lua.
 Kong's published configuration reference renders from schema.json. Maintaining
-both by hand lets them drift -- they already had, on path_identification -- so
+both by hand lets them drift -- so
 schema.json is generated and must never be edited directly.
 
 Usage:

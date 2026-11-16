@@ -43,19 +43,15 @@ LUA = genschema.LUA
 # lives, and finally diagnostics.
 SECTIONS = [
     ("Connecting to Reva Trust Guardian",
-     ["reva_host_url", "auth_token", "ssl_verify"]),
+     ["reva_host", "auth_token", "ssl_verify"]),
     ("Enforcement: what happens to a denied call",
      ["monitor_mode", "fail_open", "deny_status", "deny_message"]),
     ("Identity: who the call is attributed to",
-     ["authorize_agent", "jwt_user_claim", "jwt_groups_claim", "agent_header",
-      "require_identity_headers", "identity_source", "consumer_id_field"]),
-    ("Call classification",
-     ["path_identification"]),
-    ("Reading the payload, and grouping turns into a chat",
-     ["prompt_key", "a2a_content_path", "a2a_history_path", "a2a_routing_path",
-      "session_header", "max_session_messages", "session_ttl"]),
-    ("Data plane state and diagnostics",
-     ["hop_storage_dict", "hop_ttl", "forward_traceparent", "debug"]),
+     ["jwt_user_claim", "jwt_groups_claim"]),
+    ("Reading the payload",
+     ["prompt_key", "session_key"]),
+    ("Turns and diagnostics",
+     ["hop_ttl", "forward_traceparent", "debug"]),
 ]
 
 # Emission order within one field, so every field reads the same way.

@@ -1,16 +1,16 @@
 package = "kong-plugin-reva-ai-runtime-authorization"
-version = "0.1.0-1"
+version = "2.0.0-1"
 
 source = {
   url = "git+https://github.com/reva-ai/kong-plugin-reva-ai-runtime-authorization.git",
-  tag = "v0.1.0",
+  tag = "v2.0.0",
 }
 
 description = {
   summary  = "Reva AI Runtime Authorization: authorize agent, MCP and LLM traffic through Reva Trust Guardian.",
   detailed = [[
     Translates OpenAI-style model calls, MCP tool calls and A2A agent calls
-    passing through Kong into Reva evaluation requests, asks Reva Trust
+    passing through Kong AI Gateway into Reva evaluation requests, asks Reva Trust
     Guardian for a decision, and blocks the request when that decision is
     deny.
   ]],

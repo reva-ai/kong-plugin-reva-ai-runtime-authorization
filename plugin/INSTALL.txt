@@ -1,97 +1,107 @@
-Reva AI Runtime Authorization (kong-plugin-reva-ai-runtime-authorization) — installation
-==================================================================
+Reva AI Runtime Authorization (reva-ai-runtime-authorization) — installation
+============================================================================
 
-Authorizes agent, MCP, A2A and LLM traffic passing through Kong by evaluating
-every call against Reva Trust Guardian.
+Authorizes agent, MCP, A2A and LLM traffic passing through Kong AI Gateway by
+evaluating every call against Reva Trust Guardian.
 
-Requires Kong Gateway 3.12 or later.
+Requires Kong AI Gateway 2.2 or later.
+
+It is an AI Custom Policy: a schema (schema.lua) and a handler (handler.lua).
+Kong AI Gateway runs a custom policy in one of two ways; this one works with
+either. Pick one of sections 1 and 2, then continue at section 3.
 
 
-1. INSTALL THE PLUGIN ON EACH DATA PLANE
-----------------------------------------
+1. STREAMING POLICY (no change to the data plane image)
+-------------------------------------------------------
 
-In hybrid mode the plugin code must be present on every data plane node; the
-control plane only ever receives schema.lua.
+Konnect stores the schema and the handler and sends the handler to every data
+plane.
 
-Option A — LuaRocks, from the packed rock:
+Start every data plane with:
 
-    luarocks install kong-plugin-reva-ai-runtime-authorization-0.1.0-1.all.rock
+    KONG_CUSTOM_PLUGIN_STREAMING_ENABLED=on
+    KONG_UNTRUSTED_LUA=lax
 
-Option B — from source:
+The policy makes an outbound HTTPS call to Reva Trust Guardian, which the
+default strict Lua sandbox blocks.
+
+Create an AI Custom Policy in Konnect (UI, AI Gateway API or kongctl). The API
+call is POST /v1/ai-gateways/{aiGatewayId}/custom-policies with:
+
+    name      reva-ai-runtime-authorization
+    type      streaming
+    schema    the contents of schema.lua
+    handler   the contents of handler.lua
+
+The name must match the name declared in the schema. Neither name nor type can
+be changed afterwards.
+
+
+2. INSTALLED POLICY (code on each data plane)
+---------------------------------------------
+
+Konnect receives only the schema. The code must be on every data plane node.
+
+Option A — Docker / Kubernetes: build the data plane image with the policy in
+it.
+
+    FROM kong/kong-ai-gateway:2.3.0-distroless
+    COPY kong/plugins/reva-ai-runtime-authorization /usr/local/share/lua/5.1/kong/plugins/reva-ai-runtime-authorization
+    ENV KONG_PLUGINS=bundled,reva-ai-runtime-authorization
+
+Option B — LuaRocks, from the packed rock, then enable it in kong.conf:
+
+    luarocks install kong-plugin-reva-ai-runtime-authorization-2.0.0-1.all.rock
+
+    plugins = bundled,reva-ai-runtime-authorization
+
+or as an environment variable:
+
+    KONG_PLUGINS=bundled,reva-ai-runtime-authorization
+
+Option C — from source:
 
     luarocks make
 
-Option C — Docker / Kubernetes: copy the plugin into the image and point Kong
-at it.
-
-    COPY kong/plugins/reva-ai-runtime-authorization /opt/kong/kong/plugins/reva-ai-runtime-authorization
-    ENV KONG_LUA_PACKAGE_PATH="/opt/kong/?.lua;;"
-
-
-2. ENABLE IT IN kong.conf
--------------------------
-
-    plugins = bundled,reva-ai-runtime-authorization
-    nginx_http_lua_shared_dict = reva_ai_runtime_authorization 64m
-
-or as environment variables:
-
-    KONG_PLUGINS=bundled,reva-ai-runtime-authorization
-    KONG_NGINX_HTTP_LUA_SHARED_DICT="reva_ai_runtime_authorization 64m"
-
-The shared dictionary holds hop chains and chat history. It must not be one
-Kong manages itself: kong_db_cache is flushed on every configuration reload,
-which erases conversations in flight. If you name the dictionary something
-other than reva_ai_runtime_authorization, set hop_storage_dict to match.
-
-Restart Kong. A plugin code change requires a restart — Kong loads Lua at
+Restart the data plane. A code change requires a restart — Kong loads Lua at
 worker startup, so a configuration sync alone is not enough.
 
+Then create an AI Custom Policy in Konnect with name
+reva-ai-runtime-authorization, type installed and schema set to the contents of
+schema.lua. Do not send a handler.
 
-3. CONFIGURE
-------------
 
-Two fields are required; everything else has a working default.
+3. ATTACH AND CONFIGURE
+-----------------------
 
-    reva_host_url     base URL of your Reva tenant, e.g.
-                      https://api.example.reva.ai
+Create an AI Policy whose type is reva-ai-runtime-authorization. It has no scope
+restriction: attach it globally, or to an AI Model, AI Consumer or AI Consumer
+Group.
+
+auth_token is required; everything else has a working default.
+
+    reva_host         optional; defaults to api.reva.ai. Override with your
+                      tenant host or base URL, e.g. api.example.reva.ai
     auth_token        bearer token Kong presents to Reva Trust Guardian.
                       Use a vault reference in production.
 
-The plugin always evaluates at /pdp/v2/ai/evaluation on reva_host_url.
+The policy evaluates every matching call against Reva Trust Guardian on
+reva_host. The user comes from the JWT. An allow returns a transaction token,
+which the policy adds to the upstream request.
 
-On a gateway reachable from an untrusted network, also set:
+Example AI Policy configuration:
 
-    identity_source   consumer
+    reva_host: api.example.reva.ai
+    auth_token: "{vault://env/reva-ai-runtime-authorization-token}"
 
-so the calling agent is taken from an authenticated Kong Consumer rather than
-from the X-Reva-Agent-Id header, which any caller can set.
-
-Declarative (decK) example, applied globally:
-
-    _format_version: "3.0"
-    plugins:
-      - name: reva-ai-runtime-authorization
-        config:
-          reva_host_url: https://api.example.reva.ai
-          auth_token: ${{ env "DECK_REVA_AUTH_TOKEN" }}
-
-Admin API example:
-
-    curl -i -X POST http://localhost:8001/plugins/ \
-      --header "Content-Type: application/json" \
-      --data '{"name":"reva-ai-runtime-authorization","config":{
-                "reva_host_url":"https://api.example.reva.ai",
-                "auth_token":"'"$REVA_AUTH_TOKEN"'"}}'
-
-auth_token is referenceable: in production give it a vault reference, e.g.
-{vault://env/reva-ai-runtime-authorization-token}, rather than a literal.
+auth_token is referenceable: in production give it a vault reference, such as
+the one above, rather than a literal.
 
 
 4. REQUEST BUFFERING
 --------------------
 
-The plugin reads the request body, so routes it covers need:
+The policy reads the request body, so routes it covers need:
 
     request_buffering: true
 
@@ -100,35 +110,68 @@ MCP endpoints stream over SSE and additionally need:
     response_buffering: false
 
 
-5. VERIFY
+5. WHAT YOUR APPLICATION MUST FORWARD
+-------------------------------------
+
+The policy joins the hops of one turn only if every service in the chain passes
+on what it received. Each agent must send these headers, spelled as shown, on
+every call it makes through the gateway: to a model, an MCP server or another
+agent.
+
+    Authorization: Bearer <JWT>   on every call. The end user's token, unchanged.
+                                  A call without it is refused with 401.
+    traceparent                   on every call. Start one per user message, then
+                                  forward it unchanged. Without it Reva cannot
+                                  link a call to its turn.
+    X-Transaction-Token           on every call after the first. Issued by Reva
+                                  Trust Guardian and added by the policy to the
+                                  upstream request. Forward it exactly as
+                                  received. Its presence marks a later hop.
+    the thread id                 on the first call of a turn only, at the place
+                                  session_key names (default: the header
+                                  X-Reva-Session-Id).
+
+A call with no X-Transaction-Token is treated as the first call of a turn: the
+user comes from the JWT, and the thread id is read. A call that carries one is a
+later hop: Reva takes the agent and the user from the token, and no thread id is
+needed.
+
+The transaction token is short-lived. A call made after it has expired is
+refused with "authorization service unavailable", and the data plane log shows
+"X-Transaction-Token validation failed".
+
+
+6. VERIFY
 ---------
 
-Send a call with no Authorization bearer and no X-Reva-User. The plugin should
-reject it itself, which proves it is loaded and running:
+Send a call with no Authorization bearer. The policy should reject it itself,
+which proves it is loaded and running:
 
-    curl -i -X POST http://localhost:8000/llm/chat/completions \
+    curl -i -X POST http://localhost:8000/<your-model-route> \
       -H 'Content-Type: application/json' \
       -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
 
     HTTP/1.1 401
     {"message":"Blocked by Reva","reason":"missing Authorization bearer token"}
 
-Then repeat with a JWT (the claim named by jwt_user_claim, default sub) or, if
-the bearer is not a JWT, with X-Reva-User. authorize_agent is false by default,
-so an agent header is not required.
+Then repeat with a JWT (the claim named by jwt_user_claim, default sub):
 
     -H 'Authorization: Bearer <jwt>'
 
 Decisions are logged at info level, one line per call:
 
-    [reva-ai-runtime-authorization] invokeModel gpt-4o allowed=true status=200
+    [reva-ai-runtime-authorization] invokeModel gpt-4o allowed=true status=200 latency_ms=412.3
+
+When the first call of a turn completes, the policy reports the turn to Reva
+Trust Guardian, on a best-effort basis. A streamed A2A response (message/stream)
+is passed through as it is produced and is not reported.
 
 KONG_LOG_LEVEL must be info or lower; notice hides the decision trail.
 
 
-6. DOCUMENTATION
+7. DOCUMENTATION
 ----------------
 
     README.md     overview, request flow and the full configuration reference
 
-Plugin Hub page: https://developer.konghq.com/plugins/reva-ai-runtime-authorization/
+Documentation page: https://developer.konghq.com/plugins/reva-ai-runtime-authorization/
