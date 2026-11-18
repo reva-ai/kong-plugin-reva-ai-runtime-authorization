@@ -40,8 +40,10 @@ On every request, in the `access` phase:
    together. The policy keeps no chat history; Reva Trust Guardian does. The
    thread id is read from `session_key` only, on the first call of a turn only.
 
-4. **Evaluate.** The policy sends the call to Reva Trust Guardian on `reva_host`
-   and waits for a decision. An allow returns a transaction token.
+4. **Evaluate.** The policy sends the call to Reva Trust Guardian on `reva_host`,
+   with the name/value pairs it reads from the request body (see
+   [Context variables](#context-variables)), and waits for a decision. An allow
+   returns a transaction token.
 
 5. **Enforce.** An allow decision proxies the request upstream with the
    `traceparent` attached. Anything else terminates it with `deny_status`
@@ -115,6 +117,42 @@ evaluates it in both protocol versions and both bindings:
   `CancelTask`, `SubscribeToTask`, and the push-notification configuration
   methods), agent-card requests, the gRPC binding, and JSON-RPC batches.
 
+## Context variables
+
+Besides the prompt, the policy sends name/value pairs from the request body to
+Reva Trust Guardian as *context*, so a Reva policy can match on them, for
+example *refuse this tool when `priority` is `high`*. Which fields are read
+depends on the call:
+
+| Call | Read from | Sent under |
+|---|---|---|
+| A2A | every `metadata` object: the request's, the message's and each message part's | the metadata's own names |
+| MCP `tools/call` | everything in `params` except the tool name: `arguments` and `_meta` | the field's own name, so `_meta.progressToken` is sent as `progressToken` |
+| Model (OpenAI chat) | `metadata`, and the settings at the top of the body, such as `max_tokens`, `stream` and `user` | the field's own name |
+
+`model`, `messages` and `tools` are not sent as context: the model is the
+resource and the messages are the prompt. Everything in the fields above goes to
+Reva, so keep out of them anything you do not want evaluated.
+
+- A nested object becomes dotted names: `{"customer": {"tier": "gold"}}` is sent
+  as `customer.tier`.
+- When a name appears more than once, the more specific one wins: a part's
+  metadata over the message's over the request's; MCP `arguments` over `_meta`;
+  for a model call, a top-level setting over `metadata`.
+- Only these values are sent: text, `true` or `false`, whole numbers, and lists
+  of one of those. Null, decimals (so `temperature: 0.2`), objects inside lists,
+  empty values and lists that mix types are left out.
+- Names Reva uses itself (`action`, `subject`, `resource`, `history` and a few
+  others), names that look like credentials (`password`, `apiKey`,
+  `authorization`, `cookie`), and values that look like a bearer token or a JWT
+  are left out.
+- A call carries at most 64 pairs and 512 bytes of JSON in all. When there is
+  more, the pairs that fit are sent, taken in alphabetical order of name, and
+  the rest are left out.
+- Context is sent on every call, first or later hop, and describes that call.
+- With `debug` on, the data plane log lists, by name, the pairs that were left
+  out.
+
 ## Configuration
 
 `auth_token` is the only required field; everything else has a working
@@ -186,13 +224,13 @@ Custom Policy with `type` `installed`, sending only `schema.lua` as `schema`:
 
 ```sh
 luarocks make
-luarocks pack kong-plugin-reva-ai-runtime-authorization 2.0.0-1
+luarocks pack kong-plugin-reva-ai-runtime-authorization 2.1.0-1
 ```
 
 Then on each data plane node:
 
 ```sh
-luarocks install kong-plugin-reva-ai-runtime-authorization-2.0.0-1.all.rock
+luarocks install kong-plugin-reva-ai-runtime-authorization-2.1.0-1.all.rock
 ```
 
 and add `reva-ai-runtime-authorization` to the `plugins` directive in

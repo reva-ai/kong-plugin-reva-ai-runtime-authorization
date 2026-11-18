@@ -23,7 +23,7 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN = os.path.join(ROOT, "plugin")
 NAME = "kong-plugin-reva-ai-runtime-authorization"
-VERSION = "2.0.0-1"
+VERSION = "2.1.0-1"
 PLUGIN_NAME = "reva-ai-runtime-authorization"
 
 ROCKSPEC = "%s-%s.rockspec" % (NAME, VERSION)

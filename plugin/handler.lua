@@ -33,6 +33,9 @@ local setmetatable = setmetatable
 local fmt         = string.format
 local concat      = table.concat
 local lower       = string.lower
+local byte        = string.byte
+local sort        = table.sort
+local floor       = math.floor
 
 local EMPTY_ARRAY = cjson.empty_array
 local ARRAY_MT    = cjson.array_mt
@@ -75,7 +78,7 @@ local RevaRTG = {
   -- transformer plugins (request-transformer 801) so we evaluate the request
   -- as the client actually sent it.
   PRIORITY = 1000,
-  VERSION  = "2.0.0",
+  VERSION  = "2.1.0",
 }
 
 
@@ -451,6 +454,400 @@ local function kong_service_url()
 end
 
 
+-- ── context variables ───────────────────────────────────────────────────────
+--
+-- Name/value pairs lifted from the request body and sent to Reva as `context`,
+-- so a policy can match on them:
+--   A2A  every `metadata` object: the request's, the message's, each part's
+--   MCP  everything in params except the tool name: `arguments` and `_meta`,
+--        each under its own name
+--   LLM  `metadata`, and the call settings at the top of the body
+-- A nested object is flattened into dotted names (customer.tier). When two
+-- sources carry the same name the later, more specific one wins.
+--
+-- Reva reads only a small, strict set of pairs and refuses the whole
+-- evaluation when one pair falls outside it, so the rules are applied here and
+-- anything outside them is left out rather than sent:
+--   * a value is a string, true/false, a whole number, or a list of one of
+--     those: no null, decimals, objects, empty or mixed lists, and no text that
+--     looks like a credential
+--   * a name is not one Reva keeps for itself and does not name a credential
+--   * at most 64 pairs and 512 bytes of JSON in all; the pairs that fit, in
+--     name order, are kept
+local CONTEXT_MAX_BYTES     = 512
+local CONTEXT_MAX_PAIRS     = 64
+local CONTEXT_MAX_KEY_CHARS = 128
+local CONTEXT_MAX_DEPTH     = 8
+-- cjson writes a number of 15 or more digits in exponent form, which Reva does
+-- not read, so a larger whole number is left out.
+local CONTEXT_MAX_INT       = 99999999999999
+local CONTEXT_NOTES_MAX     = 20
+
+local function name_set(list)
+  local set = {}
+  for _, name in ipairs(list) do
+    set[name] = true
+  end
+  return set
+end
+
+-- Compared with the name lower-cased and reduced to its letters and digits, so
+-- "Api-Key", "api_key" and "apiKey" are the same name.
+local CONTEXT_RESERVED = name_set({
+  "action", "authkey", "endpointtype", "endpointurl", "history", "issuer",
+  "onbehalfof", "originurl", "origintype", "principal", "prompt",
+  "promptintent", "promptkey", "resource", "rtga2a", "subject", "threadid",
+})
+local CONTEXT_CREDENTIAL = name_set({
+  "accesstoken", "apikey", "authorization", "auth", "bearertoken",
+  "clientsecret", "cookie", "credential", "idtoken", "oauthtoken", "password",
+  "passwd", "privatekey", "proxyauthorization", "refreshtoken", "secret",
+  "secretkey", "sessiontoken", "setcookie", "transactiontoken", "xapikey",
+  "xapitoken", "xtransactiontoken",
+})
+
+
+local function fingerprint(name)
+  return lower((name:gsub("[^%w\128-\255]", "")))
+end
+
+
+local function rune_count(s)
+  local _, continuation = s:gsub("[\128-\191]", "")
+  return #s - continuation
+end
+
+
+-- A decoded JSON array: a non-empty table keyed 1..n. (cjson decodes an empty
+-- array and an empty object to the same empty table.)
+local function is_list(t)
+  if #t == 0 then
+    return false
+  end
+  for k in pairs(t) do
+    if type(k) ~= "number" then
+      return false
+    end
+  end
+  return true
+end
+
+
+local function note(dropped, text)
+  if #dropped < CONTEXT_NOTES_MAX then
+    dropped[#dropped + 1] = text
+  else
+    dropped.more = (dropped.more or 0) + 1
+  end
+end
+
+
+local function split_dots(s)
+  local parts = {}
+  for part in (s .. "."):gmatch("([^.]*)%.") do
+    parts[#parts + 1] = part
+  end
+  return parts
+end
+
+
+local function base64url_ok(part, allow_padding)
+  local body, padding = part:match("^([%w_%-]*)(=*)$")
+  if not body then
+    return false
+  end
+  if padding == "" then
+    return #body % 4 ~= 1
+  end
+  if not allow_padding then
+    return false
+  end
+  local rest = #body % 4
+  return (rest == 2 and #padding == 2) or (rest == 3 and #padding == 1)
+end
+
+
+-- Text Reva would take for a credential: a bearer value, or a signed (three
+-- parts) or encrypted (five parts) token.
+local function looks_like_credential(s)
+  local raw = s:match("^%s*(.-)%s*$")
+  if lower(raw:sub(1, 7)) == "bearer " then
+    return true
+  end
+  local parts = split_dots(raw)
+  if #parts == 3 and parts[1] ~= "" and parts[2] ~= "" then
+    local all = true
+    for _, part in ipairs(parts) do
+      if part ~= "" and not base64url_ok(part, true) then
+        all = false
+        break
+      end
+    end
+    if all then
+      return true
+    end
+  end
+  if #parts == 5 then
+    local all = true
+    for i, part in ipairs(parts) do
+      if not (i == 2 and part == "") and (part == "" or not base64url_ok(part, false)) then
+        all = false
+        break
+      end
+    end
+    if all then
+      return true
+    end
+  end
+  return false
+end
+
+
+-- Returns kind, value for a scalar Reva accepts, or nil, why not.
+local function scalar_value(v)
+  local t = type(v)
+  if t == "string" then
+    if #v > CONTEXT_MAX_BYTES - 2 then
+      return nil, "too long"
+    end
+    if looks_like_credential(v) then
+      return nil, "looks like a credential"
+    end
+    return "string", v
+  end
+  if t == "boolean" then
+    return "boolean", v
+  end
+  if t == "number" then
+    if v ~= v or v ~= floor(v) then
+      return nil, "not a whole number"
+    end
+    if v > CONTEXT_MAX_INT or v < -CONTEXT_MAX_INT then
+      return nil, "number too large"
+    end
+    return "integer", (v == 0 and 0 or v)
+  end
+  if t == "userdata" then
+    return nil, "null"
+  end
+  return nil, "unsupported value"
+end
+
+
+-- v is a scalar or a non-empty list. Returns the value to send, or nil, why not.
+local function context_value(v)
+  if type(v) ~= "table" then
+    local kind, value = scalar_value(v)
+    if not kind then
+      return nil, value
+    end
+    return value
+  end
+  if #v > CONTEXT_MAX_BYTES then
+    return nil, "list too long"
+  end
+  local list, list_kind = {}, nil
+  for i = 1, #v do
+    local item = v[i]
+    if type(item) == "table" then
+      return nil, "list of objects or lists"
+    end
+    local kind, value = scalar_value(item)
+    if not kind then
+      return nil, value
+    end
+    if list_kind and list_kind ~= kind then
+      return nil, "mixed list"
+    end
+    list_kind = kind
+    list[i] = value
+  end
+  return list
+end
+
+
+-- nil when the name can be sent, otherwise why not.
+local function context_name_problem(name)
+  if #name > CONTEXT_MAX_KEY_CHARS * 4 or rune_count(name) > CONTEXT_MAX_KEY_CHARS then
+    return "name too long"
+  end
+  if name == "" or name:find("^%s") or name:find("%s$") then
+    return "blank name"
+  end
+  local whole = fingerprint(name)
+  if CONTEXT_RESERVED[whole] then
+    return "name reserved"
+  end
+  if CONTEXT_CREDENTIAL[whole] then
+    return "name looks like a credential"
+  end
+  for segment in name:gmatch("[^.]+") do
+    if CONTEXT_CREDENTIAL[fingerprint(segment)] then
+      return "name looks like a credential"
+    end
+  end
+  return nil
+end
+
+
+local function flatten_context(source, prefix, out, dropped, depth)
+  for k, v in pairs(source) do
+    if type(k) == "string" then
+      local name = prefix and (prefix .. "." .. k) or k
+      if type(v) == "table" and not is_list(v) then
+        if next(v) ~= nil then
+          if depth >= CONTEXT_MAX_DEPTH then
+            note(dropped, name .. " (nested too deep)")
+          else
+            flatten_context(v, name, out, dropped, depth + 1)
+          end
+        end
+      else
+        local value, why = context_value(v)
+        if value == nil then
+          note(dropped, name .. " (" .. why .. ")")
+        else
+          local problem = context_name_problem(name)
+          if problem then
+            note(dropped, name .. " (" .. problem .. ")")
+          else
+            out[name] = value
+          end
+        end
+      end
+    end
+  end
+end
+
+
+-- Bytes of a JSON string, with the escapes Reva counts.
+local function json_string_len(s)
+  local n = #s + 2
+  for i = 1, #s do
+    local b = byte(s, i)
+    if b == 34 or b == 92 or b == 8 or b == 9 or b == 10 or b == 12 or b == 13 then
+      n = n + 1
+    elseif b < 32 then
+      n = n + 5
+    end
+  end
+  return n
+end
+
+
+local function json_value_len(v)
+  local t = type(v)
+  if t == "string" then
+    return json_string_len(v)
+  end
+  if t == "boolean" then
+    return v and 4 or 5
+  end
+  if t == "number" then
+    return #fmt("%d", v)
+  end
+  local n = 2 + (#v > 1 and #v - 1 or 0)
+  for i = 1, #v do
+    n = n + json_value_len(v[i])
+  end
+  return n
+end
+
+
+-- sources: tables of name/value pairs, least specific first. Returns the
+-- context table (nil when nothing qualifies) and a list of what was left out.
+local function build_context(sources)
+  local merged, dropped = {}, {}
+  for _, source in ipairs(sources) do
+    if next(source) ~= nil and not is_list(source) then
+      flatten_context(source, nil, merged, dropped, 1)
+    end
+  end
+
+  local names = {}
+  for name in pairs(merged) do
+    names[#names + 1] = name
+  end
+  sort(names)
+
+  local context, count, size = {}, 0, 2
+  for _, name in ipairs(names) do
+    local value = merged[name]
+    local added = json_string_len(name) + 1 + json_value_len(value) + (count > 0 and 1 or 0)
+    if count < CONTEXT_MAX_PAIRS and size + added <= CONTEXT_MAX_BYTES then
+      context[name] = value
+      count = count + 1
+      size = size + added
+    else
+      note(dropped, name .. " (does not fit)")
+    end
+  end
+
+  if count == 0 then
+    return nil, dropped
+  end
+  return context, dropped
+end
+
+
+local function add_source(sources, source)
+  if type(source) == "table" then
+    sources[#sources + 1] = source
+  end
+end
+
+
+-- request_meta: the metadata of the request itself (params.metadata over
+-- JSON-RPC, the body's metadata over HTTP+JSON); msg: the A2A Message.
+local function a2a_context(request_meta, msg)
+  local sources = {}
+  add_source(sources, request_meta)
+  add_source(sources, msg.metadata)
+  if type(msg.parts) == "table" then
+    for _, part in ipairs(msg.parts) do
+      if type(part) == "table" then
+        add_source(sources, part.metadata)
+      end
+    end
+  end
+  return build_context(sources)
+end
+
+
+-- params: the tools/call params. The tool name is already the resource id.
+local function mcp_context(params)
+  local sources, rest = {}, {}
+  for k, v in pairs(params) do
+    if k ~= "name" and k ~= "arguments" and k ~= "_meta" then
+      rest[k] = v
+    end
+  end
+  add_source(sources, rest)
+  add_source(sources, params._meta)
+  add_source(sources, params.arguments)
+  return build_context(sources)
+end
+
+
+-- The model and the messages are already the resource and the prompt, and a
+-- list of tool definitions is not a name/value pair.
+local LLM_NOT_CONTEXT = {
+  model = true, messages = true, tools = true, functions = true, metadata = true,
+}
+
+local function llm_context(body)
+  local sources, settings = {}, {}
+  for k, v in pairs(body) do
+    if not LLM_NOT_CONTEXT[k] then
+      settings[k] = v
+    end
+  end
+  add_source(sources, body.metadata)
+  add_source(sources, settings)
+  return build_context(sources)
+end
+
+
 local function classify_llm(body)
   local cur = last_user_index(body.messages)
   local prompt = ""
@@ -466,12 +863,15 @@ local function classify_llm(body)
     model = "unknown-model"
   end
 
+  local context, dropped = llm_context(body)
   return {
-    action     = "invokeModel",
-    role       = "agent",
-    res_type   = "Model",
-    res_id     = model,
-    prompt     = prompt,
+    action          = "invokeModel",
+    role            = "agent",
+    res_type        = "Model",
+    res_id          = model,
+    prompt          = prompt,
+    context         = context,
+    context_dropped = dropped,
   }
 end
 
@@ -503,13 +903,15 @@ local function classify_mcp(body, http_method)
   end
 
   -- Earlier turns of the chat are kept by Reva, not sent with the tool call.
+  local context, dropped = mcp_context(type(body.params) == "table" and body.params or {})
   return {
-    action       = "invokeTool",
-    role         = "agent",
-    input_values = type(args) == "table" and next(args) ~= nil and args or nil,
-    res_type     = "Tool",
-    res_id       = tool,
-    prompt       = prompt,
+    action          = "invokeTool",
+    role            = "agent",
+    res_type        = "Tool",
+    res_id          = tool,
+    prompt          = prompt,
+    context         = context,
+    context_dropped = dropped,
   }
 end
 
@@ -536,18 +938,22 @@ local A2A_REST_SEND = {
 }
 
 -- msg: the A2A Message object ({} when the request carried none)
-local function a2a_call(msg, streaming)
+-- request_meta: the metadata of the request itself, when it has any
+local function a2a_call(msg, streaming, request_meta)
   -- Current utterance from the A2A spec field message.parts.
   -- Earlier turns of the chat are kept by Reva, not read from the body. The
   -- thread id is not read here: it comes from conf.session_key (see
   -- resolve_session_id).
+  local context, dropped = a2a_context(request_meta, msg)
   return {
-    action    = "invokeAgent",
-    role      = "agent",
-    res_type  = "Agent",
-    res_id    = kong_service_url(),
-    prompt    = a2a_parts_text(msg.parts),
-    streaming = streaming,
+    action          = "invokeAgent",
+    role            = "agent",
+    res_type        = "Agent",
+    res_id          = kong_service_url(),
+    prompt          = a2a_parts_text(msg.parts),
+    streaming       = streaming,
+    context         = context,
+    context_dropped = dropped,
   }
 end
 
@@ -563,7 +969,7 @@ local function classify_a2a(body, http_method)
 
   local params = type(body.params) == "table" and body.params or {}
   local msg = type(params.message) == "table" and params.message or {}
-  return a2a_call(msg, streaming)
+  return a2a_call(msg, streaming, params.metadata)
 end
 
 
@@ -577,7 +983,7 @@ local function classify_a2a_rest(body, http_method, path)
     local n = #op.suffix
     if #path >= n and path:sub(-n) == op.suffix then
       local msg = type(body.message) == "table" and body.message or {}
-      return a2a_call(msg, op.streaming)
+      return a2a_call(msg, op.streaming, body.metadata)
     end
   end
   return nil
@@ -1152,6 +1558,16 @@ function RevaRTG:access(conf)
                   " not sent; Reva joins this hop to its thread through the trace")
   end
 
+  -- Name/value pairs from the request body (see "context variables"). They
+  -- describe this call, so every hop sends its own.
+  a2a.context = call.context
+  local dropped = call.context_dropped
+  if conf.debug and dropped and #dropped > 0 then
+    kong.log.notice("[reva-ai-runtime-authorization] context pairs not sent: ",
+                    concat(dropped, "; "),
+                    dropped.more and (" and " .. dropped.more .. " more") or "")
+  end
+
   local root = { ["rtg/a2a"] = a2a }
   root[prompt_key] = prompt
   local payload = cjson.encode(root)
@@ -1175,6 +1591,20 @@ function RevaRTG:access(conf)
                             header_token("authorization"),
                             prior_txn,
                             thread_id)
+  -- Reva turns a whole request away (HTTP 400) when one context pair is outside
+  -- what it reads. The pairs are filtered above, but if Reva's rules ever move
+  -- ahead of this filter, evaluate the call without them rather than lose the
+  -- decision.
+  if res and res.status == 400 and a2a.context then
+    kong.log.warn("[reva-ai-runtime-authorization] RTG refused the request with context; ",
+                  "evaluating again without it")
+    a2a.context = nil
+    payload = cjson.encode(root)
+    res, err = call_rtg(conf, payload, traceparent, request_id,
+                        header_token("authorization"),
+                        prior_txn,
+                        thread_id)
+  end
   local elapsed_ms = (ngx.now() - started) * 1000
 
   local allowed, decision_err, decoded

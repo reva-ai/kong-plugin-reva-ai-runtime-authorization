@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.0
+
+- Sends name/value pairs from the request body to Reva as context: the
+  `metadata` of an A2A request, message and message parts, the `arguments` and
+  `_meta` of an MCP `tools/call`, and the `metadata` and call settings of a model
+  call. Pairs Reva does not accept are left out rather than sent. See
+  [Context variables](plugin/README.md#context-variables).
+- Installs from the packed rock, `kong-plugin-reva-ai-runtime-authorization-2.1.0-1.all.rock`.
+
 ## 2.0.0
 
 Reva AI Runtime Authorization is a policy for Kong AI Gateway 2.2 and later. It

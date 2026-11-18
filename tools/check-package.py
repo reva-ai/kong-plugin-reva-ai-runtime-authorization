@@ -19,8 +19,8 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DIR = os.path.join(ROOT, "plugin")
-ROCKSPEC_NAME = "kong-plugin-reva-ai-runtime-authorization-2.0.0-1.rockspec"
-ROCK_NAME = "kong-plugin-reva-ai-runtime-authorization-2.0.0-1.all.rock"
+ROCKSPEC_NAME = "kong-plugin-reva-ai-runtime-authorization-2.1.0-1.rockspec"
+ROCK_NAME = "kong-plugin-reva-ai-runtime-authorization-2.1.0-1.all.rock"
 SKIP_DIRS = {"__pycache__", ".git", "tools"}
 SKIP_NAMES = {".DS_Store"}
 BINARY_EXT = {".rock", ".pyc", ".png", ".jpg", ".gif"}

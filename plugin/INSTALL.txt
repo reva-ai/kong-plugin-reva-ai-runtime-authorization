@@ -51,7 +51,7 @@ it.
 
 Option B — LuaRocks, from the packed rock, then enable it in kong.conf:
 
-    luarocks install kong-plugin-reva-ai-runtime-authorization-2.0.0-1.all.rock
+    luarocks install kong-plugin-reva-ai-runtime-authorization-2.1.0-1.all.rock
 
     plugins = bundled,reva-ai-runtime-authorization
 

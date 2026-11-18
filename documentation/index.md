@@ -152,7 +152,7 @@ An installed AI Custom Policy runs code that you put on each data plane.
 1. On every data plane node, install the policy:
 
    ```sh
-   luarocks install kong-plugin-reva-ai-runtime-authorization-2.0.0-1.all.rock
+   luarocks install kong-plugin-reva-ai-runtime-authorization-2.1.0-1.all.rock
    ```
 
 1. Append `reva-ai-runtime-authorization` to the `plugins` field in
@@ -377,6 +377,42 @@ other message. Image and audio parts are not sent to the Reva Trust Guardian.
 When the first call of a turn completes, the policy reports the turn to the
 Reva Trust Guardian, on a best-effort basis, so later turns can be evaluated
 against it. A streamed A2A response is not reported.
+
+## Context variables
+
+Besides the prompt, the policy sends name/value pairs from the request body to
+the Reva Trust Guardian as *context*, so a Reva policy can match on them — for
+example, *refuse this tool when `priority` is `high`*. Which fields are read
+depends on the call:
+
+| Call | Read from | Sent under |
+|---|---|---|
+| Agent | every `metadata` object: the request's, the message's and each message part's | the metadata's own names |
+| Tool | everything in `params` except the tool name: `arguments` and `_meta` | the field's own name, so `_meta.progressToken` is sent as `progressToken` |
+| Model | `metadata`, and the settings at the top of the body, such as `max_tokens`, `stream` and `user` | the field's own name |
+
+`model`, `messages` and `tools` are not sent as context: the model is the
+resource and the messages are the prompt. Everything in the fields above goes to
+Reva, so keep out of them anything you do not want evaluated.
+
+* A nested object becomes dotted names: `{"customer": {"tier": "gold"}}` is sent
+  as `customer.tier`.
+* When a name appears more than once, the more specific one wins: a part's
+  metadata over the message's over the request's; MCP `arguments` over `_meta`;
+  for a model call, a top-level setting over `metadata`.
+* Only these values are sent: text, `true` or `false`, whole numbers, and lists
+  of one of those. Null, decimals (so `temperature: 0.2`), objects inside lists,
+  empty values and lists that mix types are left out.
+* Names Reva uses itself (`action`, `subject`, `resource`, `history` and a few
+  others), names that look like credentials (`password`, `apiKey`,
+  `authorization`, `cookie`), and values that look like a bearer token or a JWT
+  are left out.
+* A call carries at most 64 pairs and 512 bytes of JSON in all. When there is
+  more, the pairs that fit are sent, taken in alphabetical order of name, and
+  the rest are left out.
+* Context is sent on every call, first or later hop, and describes that call.
+* With [`config.debug`](./reference/#schema--debug) on, the data plane log
+  lists, by name, the pairs that were left out.
 
 ## Authenticating to the Reva Trust Guardian
 

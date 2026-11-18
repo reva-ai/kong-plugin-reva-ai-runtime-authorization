@@ -40,7 +40,7 @@ KONG_UNTRUSTED_LUA=lax
 Konnect (`type` `installed`):
 
 ```sh
-luarocks install kong-plugin-reva-ai-runtime-authorization-2.0.0-1.all.rock
+luarocks install kong-plugin-reva-ai-runtime-authorization-2.1.0-1.all.rock
 ```
 
 then add `reva-ai-runtime-authorization` to the `plugins` directive in

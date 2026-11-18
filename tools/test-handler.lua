@@ -53,6 +53,7 @@ local function reset(t)
   T.captured, T.exit, T.buffering, T.invalidated = nil, nil, false, {}
   T.shared = {}
   T.store = {}
+  T.calls = {}
 end
 
 local fake_httpc = {
@@ -60,6 +61,11 @@ local fake_httpc = {
   request_uri = function(_, url, opts)
     if url:find("/evaluation", 1, true) then
       T.captured = { url = url, headers = opts.headers, body = cjson.decode(opts.body) }
+      T.calls[#T.calls + 1] = T.captured
+      -- A Reva that turns away any request carrying context.
+      if T.reject_context and T.captured.body["rtg/a2a"].context then
+        return { status = 400, body = '{"decision":false,"context":{"reason":"invalid Cedar context"}}' }
+      end
       return { status = 200, body = '{"decision":true,"token":"minted-token"}' }
     end
     if url:find("/trace/summarize", 1, true) then
@@ -134,6 +140,7 @@ end
 -- run one request; returns the evaluation body sent to Reva (or nil if none)
 local function run(name, req)
   reset({ method = req.method or "POST", path = req.path, raw = req.raw,
+          reject_context = req.reject_context,
           headers = { ["x-transaction-token"] = req.txn, ["x-reva-session-id"] = req.thread,
                       ["content-type"] = req.ct or "application/json",
                       authorization = "Bearer " .. jwt("alice"),
@@ -448,6 +455,175 @@ do
   body = arm_and_summarize("empty-body", nil)
   check("empty upstream body still summarizes but with no output field",
         body and body.trace_id ~= nil and body.output == nil, body and body.output)
+end
+
+print("Context variables")
+do
+  -- true when `ctx` holds exactly the pairs in `want` (list values compared as JSON)
+  local function exactly(ctx, want)
+    if type(ctx) ~= "table" then return false end
+    for k, v in pairs(want) do
+      if type(v) == "table" then
+        if cjson.encode(ctx[k]) ~= cjson.encode(v) then return false end
+      elseif ctx[k] ~= v then
+        return false
+      end
+    end
+    for k in pairs(ctx) do
+      if want[k] == nil then return false end
+    end
+    return true
+  end
+  local function show(ctx)
+    return ctx and cjson.encode(ctx) or "nil"
+  end
+  local function a2a_request(params)
+    return { path = "/a2a/x", raw = cjson.encode({ jsonrpc = "2.0", id = "1", method = "message/send", params = params }) }
+  end
+
+  -- A2A: the metadata of the request, the message and every part
+  local a = run("ctx-sample", { path = "/a2a/x", raw = [==[{
+    "jsonrpc": "2.0", "id": "req-98765", "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message", "messageId": "msg-001", "contextId": "ctx-session-123",
+        "taskId": "task-abc-789", "role": "user",
+        "parts": [ { "kind": "text", "text": "Generate the Q3 financial summary report.",
+                     "metadata": { "sourceLanguage": "en-US", "priority": "high" } } ],
+        "metadata": { "clientTimestamp": "2026-11-18T12:30:00Z", "originatingAgent": "orchestrator-v2" }
+      },
+      "configuration": { "acceptedOutputModes": ["text/plain", "application/json"], "historyLength": 5 },
+      "metadata": { "session_id": "my-session-123", "trace_id": "otel-trace-456", "tenant_id": "org-789" }
+    } }]==] })
+  check("A2A: request, message and part metadata all become context",
+        a and exactly(a.context, {
+          clientTimestamp = "2026-11-18T12:30:00Z", originatingAgent = "orchestrator-v2",
+          priority = "high", sourceLanguage = "en-US",
+          session_id = "my-session-123", trace_id = "otel-trace-456", tenant_id = "org-789" }),
+        a and show(a.context))
+  check("  only metadata is read: contextId, taskId and configuration are not",
+        a and a.context.contextId == nil and a.context.taskId == nil and a.context.historyLength == nil)
+
+  -- A2A: what is kept, flattened, overridden and left out
+  a = run("ctx-a2a-rules", a2a_request({
+    metadata = { channel = "web", riskLevel = "medium" },
+    message = {
+      parts = {
+        { text = "refund", metadata = { priority = "high" } },
+        { text = "again", metadata = { priority = "low" } },
+      },
+      metadata = {
+        riskLevel = "high", department = "finance", amount = 250, approved = false,
+        tags = { "refund", "vip" }, customer = { tier = "gold", region = "EU" },
+        version = "1.2.3",
+        discount = 0.15, note = cjson.null, apiKey = "abc123", ["x-api-key"] = "abc",
+        subject = "s", history = "h", on_behalf_of = "u",
+        jwtish = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln", bearer = "Bearer abc",
+        dotted = "10.20.30", big = 123456789012345,
+        emptyObject = {}, emptyList = cjson.empty_array, mixed = { 1, "a" }, objects = { { a = 1 } },
+        nested = { password = "p", ok = "fine" },
+      },
+    },
+  }))
+  check("A2A: valid pairs are kept, nested objects flattened, a later source overrides",
+        a and exactly(a.context, {
+          channel = "web", riskLevel = "high", department = "finance", amount = 250, approved = false,
+          tags = { "refund", "vip" }, ["customer.tier"] = "gold", ["customer.region"] = "EU",
+          priority = "low", version = "1.2.3", ["nested.ok"] = "fine" }),
+        a and show(a.context))
+  check("  decimals, null, objects in lists, mixed and empty lists, and 15-digit numbers are left out",
+        a and a.context.discount == nil and a.context.note == nil and a.context.objects == nil
+          and a.context.mixed == nil and a.context.emptyList == nil and a.context.big == nil)
+  check("  credential names, reserved names and credential-shaped values are left out",
+        a and a.context.apiKey == nil and a.context["x-api-key"] == nil and a.context.subject == nil
+          and a.context.history == nil and a.context.on_behalf_of == nil and a.context.jwtish == nil
+          and a.context.bearer == nil and a.context.dotted == nil and a.context["nested.password"] == nil)
+
+  a = run("ctx-none", a2a_request({ message = { parts = { { text = "no metadata" } } } }))
+  check("no metadata: no context is sent", a and a.context == nil, a and show(a.context))
+
+  a = run("ctx-rest", { path = "/a2a/v1/message:send", raw = cjson.encode({
+    metadata = { r = 3 },
+    message = { parts = { { text = "hi", metadata = { p = 1 } } }, metadata = { m = 2 } } }) })
+  check("A2A HTTP+JSON: body, message and part metadata", a and exactly(a.context, { r = 3, m = 2, p = 1 }),
+        a and show(a.context))
+
+  -- MCP: everything in params, arguments and _meta under their own names
+  a = run("ctx-mcp", { path = "/mcp/x", txn = "prior-token", raw = cjson.encode({
+    jsonrpc = "2.0", id = 7, method = "tools/call",
+    params = {
+      name = "open_ticket",
+      arguments = { title = "VPN down", priority = "high", assignee = "bob", estimate_hours = 4,
+                    filter = { status = "open" }, progressToken = "from-arguments" },
+      _meta = { progressToken = "p-1", trace = "t-9" },
+      task = { ttl = 60000 },
+    } }) })
+  check("MCP: arguments and _meta are sent under their own names; arguments win a clash",
+        a and exactly(a.context, {
+          title = "VPN down", priority = "high", assignee = "bob", estimate_hours = 4,
+          ["filter.status"] = "open", progressToken = "from-arguments", trace = "t-9",
+          ["task.ttl"] = 60000 }), a and show(a.context))
+  check("  the tool name is not repeated and nothing is prefixed with _meta",
+        a and a.context.name == nil and a.context["_meta.progressToken"] == nil)
+  check("  a later hop sends its own context too",
+        a and a.subject == nil and a.principal == nil and a.context ~= nil)
+
+  a = run("ctx-mcp-p1", { path = "/mcp/x", raw = cjson.encode({
+    jsonrpc = "2.0", id = 7, method = "tools/call",
+    params = { name = "t", _meta = { progressToken = "p-1" } } }) })
+  check("MCP: _meta.progressToken is sent as progressToken", a and exactly(a.context, { progressToken = "p-1" }),
+        a and show(a.context))
+
+  -- LLM: metadata and the call settings
+  a = run("ctx-llm", { path = "/llm/x", raw = cjson.encode({
+    model = "gpt-4o",
+    messages = { { role = "system", content = "be brief" }, { role = "user", content = "Summarise ticket 8841" } },
+    temperature = 0.2, max_tokens = 500, stream = false, user = "alice", tool_choice = "auto",
+    stop = { "END" }, response_format = { type = "json_object" },
+    metadata = { department = "finance", env = "prod" },
+    tools = { { type = "function", ["function"] = { name = "lookup_ticket" } } } }) })
+  check("LLM: metadata and call settings are sent; decimals, model, messages and tools are not",
+        a and exactly(a.context, {
+          department = "finance", env = "prod", max_tokens = 500, stream = false, user = "alice",
+          tool_choice = "auto", stop = { "END" }, ["response_format.type"] = "json_object" }),
+        a and show(a.context))
+
+  a = run("ctx-llm-bare", { path = "/llm/x", raw = cjson.encode({
+    model = "gpt-4o", messages = { { role = "user", content = "hi" } } }) })
+  check("LLM with nothing but model and messages sends no context", a and a.context == nil, a and show(a.context))
+
+  -- size: whole pairs, in name order, up to 512 bytes
+  local many = {}
+  for i = 1, 40 do many[string.format("k%02d", i)] = string.rep("v", 20) end
+  a = run("ctx-size", a2a_request({ message = { parts = { { text = "x" } }, metadata = many } }))
+  local kept, size, last = 0, 2, nil
+  for k, v in pairs(a and a.context or {}) do
+    kept = kept + 1
+    size = size + #k + 2 + 1 + #v + 2 + 1
+    if not last or k > last then last = k end
+  end
+  size = size - 1
+  check("size: only the pairs that fit in 512 bytes are sent, the first by name",
+        kept == 17 and size <= 512 and last == "k17", kept .. " pairs, " .. size .. " bytes, last " .. tostring(last))
+
+  a = run("ctx-fit", a2a_request({ message = { parts = { { text = "x" } }, metadata = {
+    a = string.rep("x", 200), b = string.rep("x", 200), c = string.rep("x", 200), d = "small" } } }))
+  check("size: a pair that does not fit is skipped, a later smaller one is still kept",
+        a and a.context.a and a.context.b and a.context.c == nil and a.context.d == "small", a and show(a.context))
+
+  a = run("ctx-escapes", a2a_request({ message = { parts = { { text = "x" } }, metadata = {
+    quotes = string.rep('"', 300), plain = string.rep("x", 300) } } }))
+  check("size: escaped characters are counted as Reva counts them",
+        a and a.context.plain ~= nil and a.context.quotes == nil, a and show(a.context))
+
+  -- safety net: Reva turns the request away because of its context
+  local t
+  a, t = run("ctx-refused", { path = "/a2a/x", reject_context = true, raw = cjson.encode({
+    jsonrpc = "2.0", id = "1", method = "message/send",
+    params = { message = { parts = { { text = "hi" } }, metadata = { channel = "web" } } } }) })
+  check("a request Reva refuses because of its context is evaluated again without it",
+        #t.calls == 2 and t.calls[1].body["rtg/a2a"].context ~= nil and t.calls[2].body["rtg/a2a"].context == nil
+          and t.exit == nil, #t.calls .. " calls")
 end
 
 print(string.format("\n%d passed, %d failed", pass, fail))

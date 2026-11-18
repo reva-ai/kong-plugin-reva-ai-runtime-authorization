@@ -1,9 +1,9 @@
 package = "kong-plugin-reva-ai-runtime-authorization"
-version = "2.0.0-1"
+version = "2.1.0-1"
 
 source = {
   url = "git+https://github.com/reva-ai/kong-plugin-reva-ai-runtime-authorization.git",
-  tag = "v2.0.0",
+  tag = "v2.1.0",
 }
 
 description = {
